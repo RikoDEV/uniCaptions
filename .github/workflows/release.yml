@@ -57,6 +57,11 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # whisper.cpp/ggml uses std::filesystem, which requires macOS 10.15+.
+          # Tauri's default deployment target (10.13) is too low and fails the
+          # build; macos-latest runners are Apple Silicon (macOS 11+ only) so
+          # raising this is safe. Ignored on non-macOS platforms.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "uniCaptions ${{ github.ref_name }}"
