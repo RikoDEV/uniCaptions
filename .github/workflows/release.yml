@@ -65,7 +65,11 @@ jobs:
           # raising this is safe. Ignored on non-macOS platforms.
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         with:
+          # Attaches build artifacts to a release you already created for this
+          # tag, instead of creating a separate one. releaseName/releaseBody
+          # are intentionally omitted so the action doesn't overwrite the
+          # title/notes you wrote by hand. releaseDraft must match the actual
+          # state of that release (false = already published).
           tagName: ${{ github.ref_name }}
-          releaseName: "uniCaptions ${{ github.ref_name }}"
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
