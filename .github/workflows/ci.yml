@@ -55,12 +55,36 @@ jobs:
         shell: pwsh
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
-      - name: Install Vulkan SDK (Windows, for whisper-rs GPU acceleration)
+      - name: Resolve latest Vulkan SDK version (Windows)
         if: matrix.os == 'windows-latest'
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        shell: pwsh
+        run: |
+          $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest/windows.txt").Trim()
+          echo "VULKAN_SDK_VERSION=$ver" >> $env:GITHUB_ENV
+          echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
+          echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
+
+      - name: Cache Vulkan SDK (Windows)
+        if: matrix.os == 'windows-latest'
+        id: vulkan-sdk-cache
+        uses: actions/cache@v4
         with:
-          vulkan-query-version: latest
-          vulkan-use-cache: true
+          path: C:\VulkanSDK
+          key: windows-vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}
+
+      - name: Install Vulkan SDK (Windows, for whisper-rs GPU acceleration)
+        # The official LunarG installer (same one used for local Windows dev,
+        # see windows_rust_toolchain notes) bundles the shader toolchain
+        # (glslc) that whisper.cpp's Vulkan backend needs at build time.
+        # humbletim/setup-vulkan-sdk was tried first but doesn't work here:
+        # it builds SDK components from source and its own source lists
+        # shaderc/glslc as a TODO, not yet supported, so ggml-vulkan's CMake
+        # step always fails with "Could NOT find Vulkan (missing: glslc)".
+        if: matrix.os == 'windows-latest' && steps.vulkan-sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe" -OutFile "$env:RUNNER_TEMP\vulkan_sdk.exe"
+          & "$env:RUNNER_TEMP\vulkan_sdk.exe" --root "$env:VULKAN_SDK" --accept-licenses --default-answer --confirm-command install
 
       - uses: dtolnay/rust-toolchain@stable
 

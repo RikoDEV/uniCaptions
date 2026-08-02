@@ -39,12 +39,31 @@ jobs:
         shell: pwsh
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
-      - name: Install Vulkan SDK (Windows, for whisper-rs GPU acceleration)
+      - name: Resolve latest Vulkan SDK version (Windows)
         if: matrix.platform == 'windows-latest'
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        shell: pwsh
+        run: |
+          $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest/windows.txt").Trim()
+          echo "VULKAN_SDK_VERSION=$ver" >> $env:GITHUB_ENV
+          echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
+          echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
+
+      - name: Cache Vulkan SDK (Windows)
+        if: matrix.platform == 'windows-latest'
+        id: vulkan-sdk-cache
+        uses: actions/cache@v4
         with:
-          vulkan-query-version: latest
-          vulkan-use-cache: true
+          path: C:\VulkanSDK
+          key: windows-vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}
+
+      - name: Install Vulkan SDK (Windows, for whisper-rs GPU acceleration)
+        # See the matching step in ci.yml for why this uses the official
+        # LunarG installer instead of humbletim/setup-vulkan-sdk.
+        if: matrix.platform == 'windows-latest' && steps.vulkan-sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe" -OutFile "$env:RUNNER_TEMP\vulkan_sdk.exe"
+          & "$env:RUNNER_TEMP\vulkan_sdk.exe" --root "$env:VULKAN_SDK" --accept-licenses --default-answer --confirm-command install
 
       - uses: dtolnay/rust-toolchain@stable
 
