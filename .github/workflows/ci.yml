@@ -55,6 +55,18 @@ jobs:
         shell: pwsh
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
+      - name: Shorten CARGO_TARGET_DIR (Windows)
+        # whisper.cpp's Vulkan shader-gen sub-build nests very deep
+        # (target/debug/build/whisper-rs-sys-<hash>/out/build/ggml/.../
+        # vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-<hash>/...).
+        # Combined with this repo's default checkout path, that exceeds
+        # Windows' 260-char MAX_PATH and fails with FileTracker FTK1011
+        # ("could not create the new file tracking log file"). Same fix as
+        # the local Windows dev setup (see windows_rust_toolchain notes).
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: echo "CARGO_TARGET_DIR=C:\ct" >> $env:GITHUB_ENV
+
       - name: Resolve latest Vulkan SDK version (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh

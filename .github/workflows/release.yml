@@ -39,6 +39,14 @@ jobs:
         shell: pwsh
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
+      - name: Shorten CARGO_TARGET_DIR (Windows)
+        # See the matching step in ci.yml: whisper.cpp's Vulkan shader-gen
+        # sub-build hits Windows' 260-char MAX_PATH with this repo's default
+        # checkout path otherwise (FileTracker FTK1011).
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: echo "CARGO_TARGET_DIR=C:\ct" >> $env:GITHUB_ENV
+
       - name: Resolve latest Vulkan SDK version (Windows)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
