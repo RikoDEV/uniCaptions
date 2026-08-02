@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -15,8 +15,23 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 const WHISPER_SIZES: [&str; 4] = ["tiny", "base", "small", "medium"];
 const TARGET_SAMPLE_RATE: u32 = 16_000;
+/// Audio context handed to whisper per inference call. Kept at 3s for
+/// transcription quality (shorter windows starve whisper of context and hurt
+/// accuracy); latency is instead cut by sliding this window forward in
+/// smaller STEP_SECONDS increments rather than shrinking it. See
+/// STEP_SECONDS below.
 const WINDOW_SECONDS: usize = 3;
+/// How far the window advances (and how often we transcribe) between calls.
+/// Smaller than WINDOW_SECONDS so windows overlap: this is the same
+/// step/length/overlap approach whisper.cpp's own streaming example uses.
+/// Roughly halves the wait for a caption update vs. re-filling the whole
+/// window from empty, at the cost of ~2x more whisper calls per second of
+/// audio (mitigated by GPU acceleration where available).
+const STEP_SECONDS: f32 = 1.5;
 const SILENCE_RMS_THRESHOLD: f32 = 0.004;
+/// Cap on whisper.cpp threads: beyond this, per-thread scheduling overhead
+/// outweighs the gains on the short (few-second) windows we transcribe.
+const MAX_WHISPER_THREADS: i32 = 8;
 
 pub enum AsrConfig {
     Local(PathBuf),
@@ -33,6 +48,7 @@ pub struct CaptioningHandle {
     stop_flag: Arc<AtomicBool>,
     capture: Option<audio::CaptureHandle>,
     worker: Option<thread::JoinHandle<()>>,
+    translate_worker: Option<thread::JoinHandle<()>>,
 }
 
 impl CaptioningHandle {
@@ -44,7 +60,127 @@ impl CaptioningHandle {
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
+        if let Some(w) = self.translate_worker.take() {
+            let _ = w.join();
+        }
     }
+}
+
+struct PendingTranslation {
+    text: String,
+    timestamp: u128,
+}
+
+/// Hands the latest untranslated caption off to the translation worker
+/// thread. Only the most recent text is kept: if translation (a blocking,
+/// non-KV-cached autoregressive decode for local models) falls behind the
+/// rate of new captions, we want the freshest text next, not a growing
+/// backlog of stale ones.
+struct TranslateSlot {
+    pending: Mutex<Option<PendingTranslation>>,
+    cvar: Condvar,
+}
+
+impl TranslateSlot {
+    fn set(&self, text: String, timestamp: u128) {
+        if let Ok(mut guard) = self.pending.lock() {
+            *guard = Some(PendingTranslation { text, timestamp });
+            self.cvar.notify_one();
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut guard) = self.pending.lock() {
+            *guard = None;
+        }
+    }
+}
+
+/// Spawns a dedicated thread that translates captions off the ASR hot path,
+/// so a slow translation (cloud round-trip, or the non-KV-cached local ONNX
+/// decode loop) never delays the next transcription window or the original-
+/// language caption reaching the overlay. Returns `None`/`None` when
+/// translation is disabled, so callers can skip the hand-off entirely.
+fn spawn_translate_worker(
+    app: AppHandle,
+    stop_flag: Arc<AtomicBool>,
+    mut translate_config: TranslateConfig,
+) -> (Option<Arc<TranslateSlot>>, Option<thread::JoinHandle<()>>) {
+    if matches!(translate_config, TranslateConfig::None) {
+        return (None, None);
+    }
+
+    let slot = Arc::new(TranslateSlot {
+        pending: Mutex::new(None),
+        cvar: Condvar::new(),
+    });
+    let slot_worker = slot.clone();
+
+    let handle = thread::Builder::new()
+        .name("unicaptions-translate".into())
+        .spawn(move || loop {
+            let job = {
+                let guard = match slot_worker.pending.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                let mut guard = guard;
+                loop {
+                    if let Some(job) = guard.take() {
+                        break job;
+                    }
+                    if stop_flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    guard = match slot_worker
+                        .cvar
+                        .wait_timeout(guard, Duration::from_millis(200))
+                    {
+                        Ok((g, _)) => g,
+                        Err(_) => return,
+                    };
+                }
+            };
+
+            let translated = match &mut translate_config {
+                TranslateConfig::Local(translator) => match translator.translate(&job.text) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        eprintln!("translation error: {e}");
+                        None
+                    }
+                },
+                TranslateConfig::Cloud { api_key, target_lang } => {
+                    match tauri::async_runtime::block_on(crate::translate::cloud::translate(
+                        api_key,
+                        &job.text,
+                        target_lang,
+                    )) {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            eprintln!("cloud translation error: {e}");
+                            None
+                        }
+                    }
+                }
+                TranslateConfig::None => None,
+            };
+
+            if let Some(translated) = translated {
+                let _ = app.emit(
+                    "caption-update",
+                    serde_json::json!({
+                        "text": job.text,
+                        "translatedText": translated,
+                        "isFinal": true,
+                        "timestamp": job.timestamp,
+                    }),
+                );
+            }
+        })
+        .ok();
+
+    (Some(slot), handle)
 }
 
 fn validate_size(size: &str) -> Result<&str, String> {
@@ -188,6 +324,9 @@ pub fn start_captioning(
         }
     })?;
 
+    let (translate_slot, translate_worker) =
+        spawn_translate_worker(app.clone(), stop_flag.clone(), translate_config);
+
     let stop_worker = stop_flag.clone();
     let app_worker = app.clone();
     let worker = thread::Builder::new()
@@ -201,7 +340,7 @@ pub fn start_captioning(
                 app_worker,
                 stop_worker,
                 language,
-                translate_config,
+                translate_slot,
             )
         })
         .map_err(|e| e.to_string())?;
@@ -210,6 +349,7 @@ pub fn start_captioning(
         stop_flag,
         capture: Some(capture),
         worker: Some(worker),
+        translate_worker,
     })
 }
 
@@ -218,12 +358,20 @@ fn transcribe_local(
     chunk: &[f32],
     language: &str,
 ) -> Result<String, String> {
+    let n_threads = thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4)
+        .min(MAX_WHISPER_THREADS);
+
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_print_progress(false);
     params.set_print_special(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
-    params.set_n_threads(4);
+    params.set_n_threads(n_threads);
+    // Each call transcribes one fixed-length window in isolation, so there's
+    // no benefit to whisper.cpp's multi-segment splitting/timestamping work.
+    params.set_single_segment(true);
     if language != "auto" {
         params.set_language(Some(language));
     }
@@ -251,9 +399,11 @@ fn run_asr_loop(
     app: AppHandle,
     stop_flag: Arc<AtomicBool>,
     language: String,
-    mut translate_config: TranslateConfig,
+    translate_slot: Option<Arc<TranslateSlot>>,
 ) {
     let window_size = TARGET_SAMPLE_RATE as usize * WINDOW_SECONDS;
+    let step_size = (TARGET_SAMPLE_RATE as f32 * STEP_SECONDS) as usize;
+    let overlap_size = window_size - step_size;
     let mut whisper_state = whisper_ctx.as_ref().and_then(|ctx| match ctx.create_state() {
         Ok(s) => Some(s),
         Err(e) => {
@@ -264,7 +414,11 @@ fn run_asr_loop(
     let mut last_caption_was_empty = true;
 
     while !stop_flag.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(200));
+        // Poll cadence, not the transcription latency floor: the window
+        // still has to fill (WINDOW_SECONDS) before there's anything new to
+        // transcribe, but a shorter poll means less time waiting to notice
+        // that it has.
+        thread::sleep(Duration::from_millis(100));
 
         if let Ok(lvl) = level.lock() {
             let _ = app.emit("audio-level", *lvl);
@@ -287,7 +441,14 @@ fn run_asr_loop(
             // up through a growing queue.
             let start = buf.len() - window_size;
             let chunk: Vec<f32> = buf[start..].to_vec();
-            buf.clear();
+            // Keep only the trailing `overlap_size` samples (the second
+            // half of this window) so the next window slides forward by
+            // `step_size` instead of starting from empty — this is what
+            // lets us transcribe every STEP_SECONDS instead of waiting a
+            // full WINDOW_SECONDS between captions. Also correctly drops
+            // any backlog beyond one window, same as the old buf.clear().
+            let keep_from = buf.len() - overlap_size;
+            buf.drain(0..keep_from);
             chunk
         };
 
@@ -296,6 +457,9 @@ fn run_asr_loop(
             // instead of leaving the last caption stuck on screen forever.
             if !last_caption_was_empty {
                 last_caption_was_empty = true;
+                if let Some(slot) = &translate_slot {
+                    slot.clear();
+                }
                 let _ = app.emit(
                     "caption-update",
                     serde_json::json!({
@@ -336,6 +500,9 @@ fn run_asr_loop(
         if text.is_empty() {
             if !last_caption_was_empty {
                 last_caption_was_empty = true;
+                if let Some(slot) = &translate_slot {
+                    slot.clear();
+                }
                 let _ = app.emit(
                     "caption-update",
                     serde_json::json!({
@@ -349,40 +516,26 @@ fn run_asr_loop(
             continue;
         }
         last_caption_was_empty = false;
+        let timestamp = now_ms();
 
-        let translated_text = match &mut translate_config {
-            TranslateConfig::Local(translator) => match translator.translate(&text) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    eprintln!("translation error: {e}");
-                    None
-                }
-            },
-            TranslateConfig::Cloud { api_key, target_lang } => {
-                match tauri::async_runtime::block_on(crate::translate::cloud::translate(
-                    api_key,
-                    &text,
-                    target_lang,
-                )) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        eprintln!("cloud translation error: {e}");
-                        None
-                    }
-                }
-            }
-            TranslateConfig::None => None,
-        };
-
+        // Emit the original-language caption immediately rather than
+        // blocking on translation (a cloud round-trip, or the local ONNX
+        // decode loop, which has no KV cache and is easily the single
+        // slowest step in the pipeline). The translation worker thread
+        // fills in `translatedText` with a follow-up event once it's ready.
         let _ = app.emit(
             "caption-update",
             serde_json::json!({
                 "text": text,
-                "translatedText": translated_text,
+                "translatedText": null,
                 "isFinal": true,
-                "timestamp": now_ms(),
+                "timestamp": timestamp,
             }),
         );
+
+        if let Some(slot) = &translate_slot {
+            slot.set(text, timestamp);
+        }
     }
 }
 

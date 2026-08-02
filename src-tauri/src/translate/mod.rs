@@ -70,6 +70,9 @@ pub fn delete_translate_model(app: &AppHandle, lang: &str) -> Result<(), String>
 struct GenerationConfig {
     decoder_start_token_id: i64,
     eos_token_id: i64,
+    num_decoder_layers: usize,
+    num_heads: usize,
+    head_dim: usize,
 }
 
 pub struct Translator {
@@ -161,7 +164,12 @@ async fn download_model_files(app: &AppHandle, target_lang: &str) -> Result<Mode
 
     let base = format!("https://huggingface.co/{repo}/resolve/main");
     let encoder_path = dir.join("encoder_model_int8.onnx");
-    let decoder_path = dir.join("decoder_model_int8.onnx");
+    // The "merged" decoder graph combines the no-cache (prefill) and
+    // with-cache (decode) branches behind a `use_cache_branch` input, so a
+    // single session can do KV-cached autoregressive decoding instead of
+    // recomputing self- and cross-attention over the whole growing sequence
+    // on every generated token.
+    let decoder_path = dir.join("decoder_model_merged_int8.onnx");
     let tokenizer_path = dir.join("tokenizer.json");
     let config_path = dir.join("config.json");
 
@@ -175,7 +183,7 @@ async fn download_model_files(app: &AppHandle, target_lang: &str) -> Result<Mode
     )
     .await?;
     download_file(
-        &format!("{base}/onnx/decoder_model_int8.onnx"),
+        &format!("{base}/onnx/decoder_model_merged_int8.onnx"),
         &decoder_path,
         app,
         target_lang,
@@ -222,6 +230,26 @@ pub async fn load_translator(app: AppHandle, target_lang: String) -> Result<Tran
         .get("eos_token_id")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    // MarianMT (OPUS-MT) config fields needed to shape the past_key_values
+    // cache tensors: [batch, num_heads, seq_len, head_dim] per decoder layer.
+    let num_decoder_layers = config_json
+        .get("decoder_layers")
+        .and_then(|v| v.as_u64())
+        .ok_or("config.json missing decoder_layers")? as usize;
+    let num_heads = config_json
+        .get("decoder_attention_heads")
+        .and_then(|v| v.as_u64())
+        .ok_or("config.json missing decoder_attention_heads")? as usize;
+    let d_model = config_json
+        .get("d_model")
+        .and_then(|v| v.as_u64())
+        .ok_or("config.json missing d_model")? as usize;
+    if num_heads == 0 || d_model % num_heads != 0 {
+        return Err(format!(
+            "invalid decoder dims: d_model={d_model}, num_heads={num_heads}"
+        ));
+    }
+    let head_dim = d_model / num_heads;
 
     let encoder = Session::builder()
         .map_err(|e| e.to_string())?
@@ -240,6 +268,9 @@ pub async fn load_translator(app: AppHandle, target_lang: String) -> Result<Tran
         config: GenerationConfig {
             decoder_start_token_id,
             eos_token_id,
+            num_decoder_layers,
+            num_heads,
+            head_dim,
         },
     })
 }
@@ -275,6 +306,18 @@ fn load_tokenizer(path: &Path) -> Result<Tokenizer, String> {
 
 const MAX_OUTPUT_TOKENS: usize = 128;
 
+/// Per-layer KV cache for the merged decoder. Self-attention (`decoder`)
+/// keys/values grow by one position each step; cross-attention (`encoder`)
+/// keys/values are the fixed projection of the encoder output, computed
+/// once on the prefill step and fed back unchanged on every decode step.
+#[derive(Default, Clone)]
+struct LayerCache {
+    decoder_key: Vec<f32>,
+    decoder_value: Vec<f32>,
+    encoder_key: Vec<f32>,
+    encoder_value: Vec<f32>,
+}
+
 impl Translator {
     pub fn translate(&mut self, text: &str) -> Result<String, String> {
         let encoding = self
@@ -306,36 +349,72 @@ impl Translator {
             .map_err(|e| e.to_string())?;
         let hidden_dims: Vec<usize> = hidden_shape.iter().map(|&d| d as usize).collect();
         let hidden_vec: Vec<f32> = hidden_data.to_vec();
+        drop(encoder_outputs);
 
-        let mut decoder_ids: Vec<i64> = vec![self.config.decoder_start_token_id];
+        let num_layers = self.config.num_decoder_layers;
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.head_dim;
 
-        for _ in 0..MAX_OUTPUT_TOKENS {
-            let dec_len = decoder_ids.len();
-            let decoder_input_tensor =
-                Tensor::from_array(([1usize, dec_len], decoder_ids.clone()))
-                    .map_err(|e| e.to_string())?;
-            let encoder_hidden_tensor =
-                Tensor::from_array((hidden_dims.clone(), hidden_vec.clone()))
-                    .map_err(|e| e.to_string())?;
-            let encoder_attn_tensor =
-                Tensor::from_array(([1usize, seq_len], attention_mask.clone()))
-                    .map_err(|e| e.to_string())?;
+        let mut cache: Vec<LayerCache> = vec![LayerCache::default(); num_layers];
+        let mut decoder_past_len: usize = 0;
+        let mut encoder_past_len: usize = 0;
 
-            let decoder_outputs = self
-                .decoder
-                .run(ort::inputs![
-                    "input_ids" => decoder_input_tensor,
-                    "encoder_hidden_states" => encoder_hidden_tensor,
-                    "encoder_attention_mask" => encoder_attn_tensor,
-                ])
+        let mut next_input_token = self.config.decoder_start_token_id;
+        let mut output_ids: Vec<u32> = Vec::new();
+
+        for step in 0..MAX_OUTPUT_TOKENS {
+            let use_cache_branch = step > 0;
+
+            let mut inputs: Vec<(std::borrow::Cow<str>, ort::session::SessionInputValue)> = Vec::new();
+            let input_ids_tensor = Tensor::from_array(([1usize, 1usize], vec![next_input_token]))
                 .map_err(|e| e.to_string())?;
+            let encoder_hidden_tensor = Tensor::from_array((hidden_dims.clone(), hidden_vec.clone()))
+                .map_err(|e| e.to_string())?;
+            let encoder_attn_tensor = Tensor::from_array(([1usize, seq_len], attention_mask.clone()))
+                .map_err(|e| e.to_string())?;
+            let use_cache_branch_tensor = Tensor::from_array(([1usize], vec![use_cache_branch]))
+                .map_err(|e| e.to_string())?;
+
+            inputs.push(("input_ids".into(), input_ids_tensor.into()));
+            inputs.push(("encoder_attention_mask".into(), encoder_attn_tensor.into()));
+            inputs.push(("encoder_hidden_states".into(), encoder_hidden_tensor.into()));
+            inputs.push(("use_cache_branch".into(), use_cache_branch_tensor.into()));
+
+            for (i, layer) in cache.iter().enumerate() {
+                let dec_key = Tensor::from_array((
+                    [1usize, num_heads, decoder_past_len, head_dim],
+                    layer.decoder_key.clone(),
+                ))
+                .map_err(|e| e.to_string())?;
+                let dec_value = Tensor::from_array((
+                    [1usize, num_heads, decoder_past_len, head_dim],
+                    layer.decoder_value.clone(),
+                ))
+                .map_err(|e| e.to_string())?;
+                let enc_key = Tensor::from_array((
+                    [1usize, num_heads, encoder_past_len, head_dim],
+                    layer.encoder_key.clone(),
+                ))
+                .map_err(|e| e.to_string())?;
+                let enc_value = Tensor::from_array((
+                    [1usize, num_heads, encoder_past_len, head_dim],
+                    layer.encoder_value.clone(),
+                ))
+                .map_err(|e| e.to_string())?;
+
+                inputs.push((format!("past_key_values.{i}.decoder.key").into(), dec_key.into()));
+                inputs.push((format!("past_key_values.{i}.decoder.value").into(), dec_value.into()));
+                inputs.push((format!("past_key_values.{i}.encoder.key").into(), enc_key.into()));
+                inputs.push((format!("past_key_values.{i}.encoder.value").into(), enc_value.into()));
+            }
+
+            let decoder_outputs = self.decoder.run(inputs).map_err(|e| e.to_string())?;
 
             let (logits_shape, logits_data) = decoder_outputs["logits"]
                 .try_extract_tensor::<f32>()
                 .map_err(|e| e.to_string())?;
             let vocab_size = *logits_shape.last().ok_or("empty logits shape")? as usize;
-            let last_step_start = (dec_len - 1) * vocab_size;
-            let last_step_logits = &logits_data[last_step_start..last_step_start + vocab_size];
+            let last_step_logits = &logits_data[0..vocab_size];
 
             let (next_token, _) = last_step_logits
                 .iter()
@@ -348,13 +427,41 @@ impl Translator {
                     }
                 });
 
+            // Pull this step's present.* outputs into the cache before
+            // `decoder_outputs` (and the borrows into it) go out of scope.
+            for (i, layer) in cache.iter_mut().enumerate() {
+                let (_, dec_key) = decoder_outputs[format!("present.{i}.decoder.key").as_str()]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| e.to_string())?;
+                let (_, dec_value) = decoder_outputs[format!("present.{i}.decoder.value").as_str()]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| e.to_string())?;
+                layer.decoder_key = dec_key.to_vec();
+                layer.decoder_value = dec_value.to_vec();
+
+                if !use_cache_branch {
+                    // Cross-attention KV only needs computing once, on the
+                    // prefill step; every decode step after that reuses it.
+                    let (_, enc_key) = decoder_outputs[format!("present.{i}.encoder.key").as_str()]
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| e.to_string())?;
+                    let (_, enc_value) = decoder_outputs[format!("present.{i}.encoder.value").as_str()]
+                        .try_extract_tensor::<f32>()
+                        .map_err(|e| e.to_string())?;
+                    layer.encoder_key = enc_key.to_vec();
+                    layer.encoder_value = enc_value.to_vec();
+                }
+            }
+            decoder_past_len += 1;
+            encoder_past_len = seq_len;
+
             if next_token as i64 == self.config.eos_token_id {
                 break;
             }
-            decoder_ids.push(next_token as i64);
+            output_ids.push(next_token as u32);
+            next_input_token = next_token as i64;
         }
 
-        let output_ids: Vec<u32> = decoder_ids[1..].iter().map(|&id| id as u32).collect();
         self.tokenizer
             .decode(&output_ids, true)
             .map_err(|e| e.to_string())

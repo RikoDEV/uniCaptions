@@ -36,3 +36,8 @@ ndarray = "0.16"
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.17"
+# GPU-accelerated whisper.cpp inference via Vulkan (works across NVIDIA/AMD/Intel).
+# Requires the Vulkan SDK (with glslc/shaderc) installed on the build machine;
+# at runtime it falls back to whatever Vulkan-capable device is present, or
+# silently no-ops to CPU if no such device/driver is found.
+whisper-rs = { version = "0.16", features = ["vulkan"] }
