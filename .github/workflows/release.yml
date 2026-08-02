@@ -41,7 +41,7 @@ jobs:
 
       - name: Install Vulkan SDK (Windows, for whisper-rs GPU acceleration)
         if: matrix.platform == 'windows-latest'
-        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-query-version: latest
           vulkan-use-cache: true
