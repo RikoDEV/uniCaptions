@@ -46,10 +46,46 @@ struct Runtime {
     tracker: crate::window_state::Tracker,
 }
 
+/// The visible caption plus the bookkeeping that keeps late events from
+/// showing stale text.
+#[derive(Default)]
+struct CaptionState {
+    view: CaptionView,
+    /// Timestamp of the latest "clear" event.
+    cleared_at: u128,
+    /// Timestamp of the original text the shown translation belongs to.
+    translation_at: u128,
+}
+
+impl CaptionState {
+    fn apply(&mut self, event: &CaptionEvent) {
+        if event.text.is_empty() {
+            self.view = CaptionView::default();
+            self.cleared_at = event.timestamp;
+            self.translation_at = 0;
+            return;
+        }
+        match &event.translated_text {
+            // A new original caption. Keep the current translation (same
+            // utterance) so it does not blink off between updates.
+            None => self.view.text = event.text.clone(),
+            // A translation of an earlier snippet: only ever move forward, and
+            // never resurrect text from before the last clear. It does not
+            // touch the original text.
+            Some(tr) => {
+                if event.timestamp > self.cleared_at && event.timestamp >= self.translation_at {
+                    self.view.translated = Some(tr.clone());
+                    self.translation_at = event.timestamp;
+                }
+            }
+        }
+    }
+}
+
 /// State shared between the main window (which receives engine events) and the
 /// overlay viewport (which paints them).
 pub struct OverlayShared {
-    caption: Mutex<CaptionView>,
+    caption: Mutex<CaptionState>,
     store: Arc<SettingsStore>,
     window_file: PathBuf,
     runtime: Mutex<Runtime>,
@@ -58,7 +94,7 @@ pub struct OverlayShared {
 impl OverlayShared {
     pub fn new(store: Arc<SettingsStore>, window_file: PathBuf) -> Arc<Self> {
         Arc::new(Self {
-            caption: Mutex::new(CaptionView::default()),
+            caption: Mutex::new(CaptionState::default()),
             store,
             window_file,
             runtime: Mutex::new(Runtime {
@@ -71,15 +107,20 @@ impl OverlayShared {
         })
     }
 
+    /// Applies a caption event. Translation results arrive later and out of band,
+    /// so they must never replace newer original text, and must never bring back
+    /// a caption that has since been cleared.
     pub fn set_caption(&self, event: &CaptionEvent) {
-        if let Ok(mut c) = self.caption.lock() {
-            c.text = event.text.clone();
-            c.translated = event.translated_text.clone();
+        if let Ok(mut st) = self.caption.lock() {
+            st.apply(event);
         }
     }
 
     pub fn caption(&self) -> CaptionView {
-        self.caption.lock().map(|c| c.clone()).unwrap_or_default()
+        self.caption
+            .lock()
+            .map(|c| c.view.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -136,12 +177,6 @@ pub fn is_cjk(c: char) -> bool {
 
 pub fn has_cjk(s: &str) -> bool {
     s.chars().any(is_cjk)
-}
-
-/// Rows left for the translation once the original has used `rows_used`
-/// (the old CSS applied one `-webkit-line-clamp` to the whole box).
-pub fn translation_row_budget(max_lines: u32, rows_used: usize) -> usize {
-    (max_lines.max(1) as usize).saturating_sub(rows_used)
 }
 
 /// The eight invisible resize handles along the window edges.
@@ -209,6 +244,31 @@ fn layout(
     ctx.fonts_mut(|f| f.layout_job(job))
 }
 
+/// Lays `text` out and keeps only its last `max_rows` rows, so newly added words
+/// push older lines up and off the top (live-caption style) instead of the
+/// newest words being cut off.
+fn layout_tail(
+    ctx: &Context,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    width: f32,
+    max_rows: usize,
+) -> Arc<Galley> {
+    let max_rows = max_rows.max(1);
+    let full = layout(ctx, text, font.clone(), color, width, usize::MAX);
+    if full.rows.len() <= max_rows {
+        return full;
+    }
+    let skip_rows = full.rows.len() - max_rows;
+    let skip_chars: usize = full.rows[..skip_rows]
+        .iter()
+        .map(|r| r.char_count_including_newline().0)
+        .sum();
+    let tail: String = text.chars().skip(skip_chars).collect();
+    layout(ctx, tail.trim_start(), font, color, width, max_rows)
+}
+
 /// One laid-out block (original or translation) and the gap above it.
 struct Block {
     galley: Arc<Galley>,
@@ -233,10 +293,9 @@ fn compute_layout(
     let max_lines = style.max_lines.max(1);
 
     let mut blocks: Vec<Block> = Vec::new();
-    let mut rows_used = 0usize;
 
     if style.show_original && !view.text.trim().is_empty() {
-        let g = layout(
+        let g = layout_tail(
             ctx,
             view.text.trim(),
             font.clone(),
@@ -244,7 +303,6 @@ fn compute_layout(
             max_text_w,
             max_lines as usize,
         );
-        rows_used = g.rows.len();
         blocks.push(Block {
             galley: g,
             gap_above: 0.0,
@@ -257,27 +315,24 @@ fn compute_layout(
             .map(str::trim)
             .filter(|t| !t.is_empty())
         {
-            let budget = translation_row_budget(max_lines, rows_used);
-            if budget > 0 {
-                let tfont = FontId::new(font.size * TRANSLATION_SCALE, caption_family());
-                let g = layout(
-                    ctx,
-                    tr,
-                    tfont,
-                    color.gamma_multiply(TRANSLATION_SCALE),
-                    max_text_w,
-                    budget,
-                );
-                let gap = if blocks.is_empty() {
-                    0.0
-                } else {
-                    TRANSLATION_GAP
-                };
-                blocks.push(Block {
-                    galley: g,
-                    gap_above: gap,
-                });
-            }
+            let tfont = FontId::new(font.size * TRANSLATION_SCALE, caption_family());
+            let g = layout_tail(
+                ctx,
+                tr,
+                tfont,
+                color.gamma_multiply(TRANSLATION_SCALE),
+                max_text_w,
+                max_lines as usize,
+            );
+            let gap = if blocks.is_empty() {
+                0.0
+            } else {
+                TRANSLATION_GAP
+            };
+            blocks.push(Block {
+                galley: g,
+                gap_above: gap,
+            });
         }
     }
     if blocks.is_empty() {
@@ -427,15 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn translation_gets_the_remaining_line_budget() {
-        assert_eq!(translation_row_budget(2, 1), 1);
-        assert_eq!(translation_row_budget(2, 2), 0);
-        assert_eq!(translation_row_budget(5, 1), 4);
-        assert_eq!(translation_row_budget(0, 0), 1);
-        assert_eq!(translation_row_budget(2, 9), 0);
-    }
-
-    #[test]
     fn hotspots_cover_the_edges_without_overlap() {
         let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 160.0));
         let spots = resize_hotspots(full);
@@ -559,15 +605,111 @@ mod tests {
         let store = SettingsStore::open(dir.path().join("s.json"));
         let shared = OverlayShared::new(store, dir.path().join("w.json"));
         assert_eq!(shared.caption(), CaptionView::default());
-        shared.set_caption(&CaptionEvent {
-            text: "hi".into(),
-            translated_text: Some("hola".into()),
-            is_final: true,
-            timestamp: 1,
-        });
+        shared.set_caption(&original("hi", 1));
+        shared.set_caption(&translation("hi", "hola", 1));
+        assert_eq!(shared.caption().text, "hi");
         assert_eq!(shared.caption().translated.as_deref(), Some("hola"));
         shared.set_caption(&CaptionEvent::clear(2));
         assert_eq!(shared.caption(), CaptionView::default());
+    }
+
+    fn original(text: &str, ts: u128) -> CaptionEvent {
+        CaptionEvent {
+            text: text.into(),
+            translated_text: None,
+            is_final: true,
+            timestamp: ts,
+        }
+    }
+
+    fn translation(text: &str, tr: &str, ts: u128) -> CaptionEvent {
+        CaptionEvent {
+            text: text.into(),
+            translated_text: Some(tr.into()),
+            is_final: true,
+            timestamp: ts,
+        }
+    }
+
+    fn state_with() -> CaptionState {
+        CaptionState::default()
+    }
+
+    #[test]
+    fn a_late_translation_never_replaces_newer_original_text() {
+        let mut st = state_with();
+        st.apply(&original("hello", 10));
+        st.apply(&original("hello there my friend", 20));
+        // translation of the *older* snippet arrives afterwards
+        st.apply(&translation("hello", "hola", 10));
+        assert_eq!(st.view.text, "hello there my friend");
+        assert_eq!(st.view.translated.as_deref(), Some("hola"));
+    }
+
+    #[test]
+    fn a_translation_from_before_a_clear_does_not_resurrect_the_caption() {
+        let mut st = state_with();
+        st.apply(&original("old sentence", 10));
+        st.apply(&CaptionEvent::clear(30));
+        st.apply(&translation("old sentence", "vieja frase", 10));
+        assert_eq!(st.view, CaptionView::default());
+        // and a translation for the next utterance still works
+        st.apply(&original("new one", 40));
+        st.apply(&translation("new one", "nueva", 40));
+        assert_eq!(st.view.translated.as_deref(), Some("nueva"));
+    }
+
+    #[test]
+    fn translations_only_move_forward() {
+        let mut st = state_with();
+        st.apply(&original("a b c", 50));
+        st.apply(&translation("a b c", "newer", 50));
+        st.apply(&translation("a b", "older", 40));
+        assert_eq!(st.view.translated.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn translation_survives_original_updates_within_one_utterance() {
+        let mut st = state_with();
+        st.apply(&original("one", 1));
+        st.apply(&translation("one", "uno", 1));
+        st.apply(&original("one two", 2));
+        assert_eq!(
+            st.view.translated.as_deref(),
+            Some("uno"),
+            "must not blink off"
+        );
+    }
+
+    #[test]
+    fn new_words_push_old_lines_up_and_the_latest_words_stay_visible() {
+        let ctx = headless_ctx();
+        let style = CaptionStyle {
+            max_lines: 2,
+            ..CaptionStyle::default()
+        };
+        let text = (1..=60)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let view = CaptionView {
+            text,
+            translated: None,
+        };
+        let mut shown = String::new();
+        crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
+            let l = compute_layout(ui.ctx(), &view, &style, 700.0).unwrap();
+            shown = l.blocks[0].galley.text().to_string();
+            assert_eq!(l.blocks[0].galley.rows.len(), 2);
+        });
+        assert!(
+            shown.contains("word60"),
+            "newest words must be visible: {shown}"
+        );
+        assert!(
+            !shown.contains("word1 "),
+            "oldest words must scroll off: {shown}"
+        );
     }
 
     #[test]

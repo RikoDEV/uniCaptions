@@ -18,15 +18,37 @@ pub fn strip_overlay_chrome() -> bool {
     }
     use std::ffi::c_void;
     use windows_sys::core::BOOL;
-    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_NCRENDERING_POLICY,
         DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextW, GetWindowThreadProcessId,
+        EnumWindows, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId,
+        SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, WM_NCCALCSIZE, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+        WS_SYSMENU,
     };
+
+    const SUBCLASS_ID: usize = 0x756e_6963; // "unic"
+
+    /// Window procedure hook: no non-client area.
+    unsafe extern "system" fn no_frame_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        _data: usize,
+    ) -> LRESULT {
+        // wParam != 0: the proposed client rectangle (= whole window) is used as is.
+        if msg == WM_NCCALCSIZE && wparam != 0 {
+            return 0;
+        }
+        DefSubclassProc(hwnd, msg, wparam, lparam)
+    }
 
     /// `DWMWA_COLOR_NONE`: draw no border at all.
     const COLOR_NONE: u32 = 0xFFFF_FFFE;
@@ -75,6 +97,30 @@ pub fn strip_overlay_chrome() -> bool {
         set(DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED as u32); // no shadow
         set(DWMWA_BORDER_COLOR, COLOR_NONE); // no border
         set(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND as u32);
+
+        // Disabling DWM's non-client rendering makes Windows paint the legacy
+        // sizing frame (a visible line on every edge) instead. Remove the
+        // non-client area altogether: with WM_NCCALCSIZE answered as "the client
+        // area is the whole window" there is nothing left to draw. Resizing keeps
+        // working because the window keeps its WS_THICKFRAME style.
+        SetWindowSubclass(search.found, Some(no_frame_proc), SUBCLASS_ID, 0);
+        // winit leaves the overlay with a full WS_OVERLAPPEDWINDOW style (caption,
+        // system menu, min/max boxes) and merely hides the title bar by zeroing the
+        // non-client area; DWM can still paint a line of that frame at the window
+        // edge. Remove the caption-related styles outright. WS_THICKFRAME stays so
+        // the OS-driven edge resize keeps working.
+        let style = GetWindowLongPtrW(search.found, GWL_STYLE);
+        let remove = (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX) as isize;
+        SetWindowLongPtrW(search.found, GWL_STYLE, style & !remove);
+        SetWindowPos(
+            search.found,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         true
     }
 }

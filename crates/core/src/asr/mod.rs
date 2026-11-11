@@ -1,4 +1,5 @@
 mod cloud;
+pub mod stream;
 
 use crate::audio;
 use crate::events::{CaptionEvent, EventSink, ModelKind, SharedSink, UiEvent};
@@ -12,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use stream::{StreamState, Word};
 use tokio::runtime::Handle;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -33,12 +35,22 @@ const CLOUD_MIN_SECONDS: f32 = 1.5;
 const CLOUD_STEP_SECONDS: f32 = 1.5;
 /// A caption is cleared once this much trailing audio is silent. Holding it a
 /// little keeps captions readable across short pauses.
-const SILENCE_HOLD_SECONDS: f32 = 1.5;
+const SILENCE_HOLD_SECONDS: f32 = 2.0;
 /// How often the worker checks for new audio.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Level-meter events are emitted at most this often.
 const LEVEL_INTERVAL: Duration = Duration::from_millis(100);
 const SILENCE_RMS_THRESHOLD: f32 = 0.004;
+/// Once words were committed, the next pass needs a little audio: Whisper is
+/// unreliable on windows much shorter than this and drops words.
+const LOCAL_MIN_AFTER_COMMIT_SECONDS: f32 = 0.8;
+/// Hard cap on buffered audio if recognition ever falls far behind.
+const MAX_AUDIO_SECONDS: f32 = 20.0;
+/// Segments Whisper is this sure contain no speech are discarded (it tends to
+/// hallucinate text on silence/noise).
+const NO_SPEECH_THRESHOLD: f32 = 0.6;
+/// How many trailing words are sent to the translator.
+const TRANSLATE_TAIL_WORDS: usize = 24;
 /// Cap on whisper.cpp threads: beyond this, per-thread scheduling overhead
 /// outweighs the gains on the short (few-second) windows we transcribe.
 const MAX_WHISPER_THREADS: i32 = 8;
@@ -399,9 +411,12 @@ fn transcribe_local(
     // Each call transcribes one fixed-length window in isolation, so there's
     // no benefit to whisper.cpp's multi-segment splitting/timestamping work.
     params.set_single_segment(true);
-    if language != "auto" {
-        params.set_language(Some(language));
-    }
+    // whisper-rs defaults to English, so "auto" must be asked for explicitly.
+    params.set_language(if language == "auto" {
+        None
+    } else {
+        Some(language)
+    });
 
     state.full(params, chunk).map_err(|e| e.to_string())?;
 
@@ -431,6 +446,248 @@ pub fn transcribe_samples(
     .map_err(|e| format!("failed to load whisper model: {e}"))?;
     let mut state = ctx.create_state().map_err(|e| e.to_string())?;
     transcribe_local(&mut state, samples_16k, language)
+}
+
+struct Transcription {
+    words: Vec<Word>,
+    /// Language Whisper detected (only meaningful when asked to auto-detect).
+    detected_lang: Option<String>,
+}
+
+fn is_special_token(text: &str) -> bool {
+    text.starts_with("[_") || text.starts_with("<|")
+}
+
+/// `[MUSIC]`, `(applause)` and similar non-speech annotations.
+fn is_annotation(text: &str) -> bool {
+    let t = text.trim();
+    (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('(') && t.ends_with(')'))
+}
+
+/// Groups Whisper tokens into words with timings (centisecond token times).
+fn group_tokens(tokens: &[(String, f32, f32)]) -> Vec<Word> {
+    let mut words: Vec<Word> = Vec::new();
+    for (text, t0, t1) in tokens {
+        let starts_word = text.starts_with(' ')
+            || words.is_empty()
+            || text.chars().next().is_some_and(stream::is_cjk);
+        let piece = text.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if starts_word {
+            words.push(Word {
+                text: piece.to_string(),
+                t0: *t0,
+                t1: *t1,
+            });
+        } else if let Some(last) = words.last_mut() {
+            last.text.push_str(piece);
+            last.t1 = last.t1.max(*t1);
+        }
+    }
+    words
+}
+
+/// Like [`transcribe_local`], but returns timed words and the detected language.
+fn transcribe_words(
+    state: &mut whisper_rs::WhisperState,
+    chunk: &[f32],
+    language: &str,
+) -> Result<Transcription, String> {
+    let n_threads = thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4)
+        .min(MAX_WHISPER_THREADS);
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_print_progress(false);
+    params.set_print_special(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_n_threads(n_threads);
+    params.set_single_segment(true);
+    // We feed the whole uncommitted window every time, so earlier text must not
+    // be carried over as a prompt (that makes the output repeat/drift).
+    params.set_no_context(true);
+    params.set_token_timestamps(true);
+    // whisper-rs defaults to English, so "auto" must be asked for explicitly.
+    params.set_language(if language == "auto" {
+        None
+    } else {
+        Some(language)
+    });
+
+    state.full(params, chunk).map_err(|e| e.to_string())?;
+
+    let mut tokens: Vec<(String, f32, f32)> = Vec::new();
+    for i in 0..state.full_n_segments() {
+        let Some(seg) = state.get_segment(i) else {
+            continue;
+        };
+        if seg.no_speech_probability() > NO_SPEECH_THRESHOLD {
+            continue;
+        }
+        for t in 0..seg.n_tokens() {
+            let Some(tok) = seg.get_token(t) else {
+                continue;
+            };
+            let Ok(text) = tok.to_str_lossy() else {
+                continue;
+            };
+            if is_special_token(&text) {
+                continue;
+            }
+            let d = tok.token_data();
+            tokens.push((text.into_owned(), d.t0 as f32 / 100.0, d.t1 as f32 / 100.0));
+        }
+    }
+
+    let mut words = group_tokens(&tokens);
+    let joined = words
+        .iter()
+        .map(|w| w.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if is_annotation(&joined) {
+        words.clear();
+    }
+
+    let detected_lang = if language == "auto" {
+        whisper_rs::get_lang_str(state.full_lang_id_from_state()).map(str::to_string)
+    } else {
+        None
+    };
+    Ok(Transcription {
+        words,
+        detected_lang,
+    })
+}
+
+/// With "auto" language, detection on short windows flips between similar
+/// languages and garbles the text. Lock onto a language once two consecutive
+/// detections agree, until the utterance ends.
+struct LanguageLock {
+    auto: bool,
+    configured: String,
+    candidate: Option<(String, u32)>,
+    locked: Option<String>,
+}
+
+impl LanguageLock {
+    fn new(configured: &str) -> Self {
+        Self {
+            auto: configured == "auto",
+            configured: configured.to_string(),
+            candidate: None,
+            locked: None,
+        }
+    }
+
+    /// Language to pass to Whisper for the next pass.
+    fn current(&self) -> &str {
+        if !self.auto {
+            &self.configured
+        } else {
+            self.locked.as_deref().unwrap_or("auto")
+        }
+    }
+
+    fn observe(&mut self, detected: Option<String>, had_words: bool) {
+        if !self.auto || self.locked.is_some() || !had_words {
+            return;
+        }
+        let Some(lang) = detected else {
+            return;
+        };
+        let count = match &self.candidate {
+            Some((c, n)) if *c == lang => n + 1,
+            _ => 1,
+        };
+        if count >= 2 {
+            self.locked = Some(lang);
+            self.candidate = None;
+        } else {
+            self.candidate = Some((lang, count));
+        }
+    }
+
+    /// A new utterance may be in a different language.
+    fn reset_utterance(&mut self) {
+        self.locked = None;
+        self.candidate = None;
+    }
+}
+
+/// Tracks how long the input has been silent, in real time. This must not be
+/// derived from the (trimmed) recognition buffer, which after a commit may hold
+/// only a short gap between two words.
+#[derive(Default)]
+struct SilenceTracker {
+    trailing: usize,
+}
+
+impl SilenceTracker {
+    fn push(&mut self, samples: &[f32], threshold: f32) {
+        if samples.is_empty() {
+            return;
+        }
+        if audio::rms(samples) < threshold {
+            self.trailing += samples.len();
+        } else {
+            self.trailing = 0;
+        }
+    }
+
+    fn silent_for(&self, samples: usize) -> bool {
+        self.trailing >= samples
+    }
+}
+
+/// Finds a cut point inside a silent gap of `audio`, within `lo..=hi` seconds.
+/// Returns the middle of the silent run closest to the middle of the range.
+fn find_silent_cut(audio: &[f32], lo: f32, hi: f32) -> Option<f32> {
+    const FRAME: usize = 320; // 20 ms
+    const MIN_RUN: usize = 4; // 80 ms of silence
+    let sr = TARGET_SAMPLE_RATE as f32;
+    if audio.len() < FRAME * MIN_RUN || hi < lo {
+        return None;
+    }
+    // "Silent" relative to this window, so a noisy room still has gaps.
+    let threshold = (audio::rms(audio) * 0.25).max(0.003);
+    let silent: Vec<bool> = audio
+        .chunks(FRAME)
+        .map(|f| audio::rms(f) < threshold)
+        .collect();
+    let target = (lo + hi) / 2.0;
+    let mut best: Option<(f32, f32)> = None; // (distance, cut time)
+    let mut i = 0;
+    while i < silent.len() {
+        if !silent[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < silent.len() && silent[i] {
+            i += 1;
+        }
+        if i - start < MIN_RUN {
+            continue;
+        }
+        let (a, b) = (
+            start as f32 * FRAME as f32 / sr,
+            i as f32 * FRAME as f32 / sr,
+        );
+        if b < lo || a > hi {
+            continue; // the run does not touch the allowed range
+        }
+        let cut = ((a + b) / 2.0).clamp(lo, hi);
+        let dist = (cut - target).abs();
+        if best.is_none_or(|(d, _)| dist < d) {
+            best = Some((dist, cut));
+        }
+    }
+    best.map(|(_, cut)| cut)
 }
 
 /// When to run the recogniser, in samples.
@@ -482,26 +739,193 @@ fn run_asr_loop(
     language: String,
     translate_slot: Option<Arc<TranslateSlot>>,
 ) {
-    let cadence = Cadence::new(cloud_asr_key.is_none());
-    let silence_hold = (TARGET_SAMPLE_RATE as f32 * SILENCE_HOLD_SECONDS) as usize;
-    let mut whisper_state = whisper_ctx
-        .as_ref()
-        .and_then(|ctx| match ctx.create_state() {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("failed to create whisper state: {e}");
-                None
-            }
-        });
+    match (whisper_ctx, cloud_asr_key) {
+        (Some(ctx), _) => match ctx.create_state() {
+            Ok(state) => run_local_loop(
+                state,
+                buffer,
+                level,
+                sink,
+                stop_flag,
+                language,
+                translate_slot,
+            ),
+            Err(e) => eprintln!("failed to create whisper state: {e}"),
+        },
+        (None, Some(key)) => run_cloud_loop(
+            key,
+            buffer,
+            level,
+            sink,
+            rt,
+            stop_flag,
+            language,
+            translate_slot,
+        ),
+        (None, None) => {}
+    }
+}
+
+fn emit_clear(sink: &SharedSink, slot: &Option<Arc<TranslateSlot>>) {
+    if let Some(slot) = slot {
+        slot.clear();
+    }
+    sink.emit(UiEvent::Caption(CaptionEvent::clear(now_ms())));
+}
+
+fn emit_caption(sink: &SharedSink, slot: &Option<Arc<TranslateSlot>>, text: String) {
+    let timestamp = now_ms();
+    sink.emit(UiEvent::Caption(CaptionEvent {
+        text: text.clone(),
+        translated_text: None,
+        is_final: true,
+        timestamp,
+    }));
+    // Translating the whole accumulated text would be slow and its result
+    // always stale; translate just the latest words.
+    if let Some(slot) = slot {
+        slot.set(
+            StreamState::tail_words(&text, TRANSLATE_TAIL_WORDS),
+            timestamp,
+        );
+    }
+}
+
+/// Local Whisper: YouTube-style captions. Audio accumulates; the whole
+/// uncommitted window is re-transcribed every few hundred ms, words that two
+/// consecutive passes agree on are committed (and their audio dropped), and
+/// only the last few words may still change.
+fn run_local_loop(
+    mut state: whisper_rs::WhisperState,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    level: Arc<Mutex<f32>>,
+    sink: SharedSink,
+    stop_flag: Arc<AtomicBool>,
+    language: String,
+    translate_slot: Option<Arc<TranslateSlot>>,
+) {
+    let cadence = Cadence::new(true);
+    let sr = TARGET_SAMPLE_RATE as f32;
+    let silence_hold = (sr * SILENCE_HOLD_SECONDS) as usize;
+    let min_after_commit = (sr * LOCAL_MIN_AFTER_COMMIT_SECONDS) as usize;
+    let max_audio = (sr * MAX_AUDIO_SECONDS) as usize;
+
     // The first inference on a GPU backend compiles its compute pipelines,
     // which can take ~2 s. Pay that now, on silence, so the first real caption
     // is not delayed by it (audio keeps buffering meanwhile).
-    if let Some(state) = whisper_state.as_mut() {
-        let silence = vec![0.0f32; TARGET_SAMPLE_RATE as usize];
-        let _ = transcribe_local(state, &silence, &language);
+    let silence = vec![0.0f32; TARGET_SAMPLE_RATE as usize];
+    let _ = transcribe_local(&mut state, &silence, &language);
+
+    let mut audio: Vec<f32> = Vec::new();
+    let mut new_since = 0usize;
+    let mut silence = SilenceTracker::default();
+    let mut stream = StreamState::new();
+    let mut lang = LanguageLock::new(&language);
+    let mut last_display = String::new();
+    let mut last_level_emit = std::time::Instant::now();
+
+    while !stop_flag.load(Ordering::SeqCst) {
+        thread::sleep(POLL_INTERVAL);
+
+        if last_level_emit.elapsed() >= LEVEL_INTERVAL {
+            last_level_emit = std::time::Instant::now();
+            if let Ok(lvl) = level.lock() {
+                sink.emit(UiEvent::AudioLevel(*lvl));
+            }
+        }
+
+        // Take whatever the capture thread has gathered.
+        if let Ok(mut buf) = buffer.lock() {
+            silence.push(&buf, SILENCE_RMS_THRESHOLD);
+            new_since += buf.len();
+            audio.append(&mut buf);
+        }
+        if audio.len() > max_audio {
+            let excess = audio.len() - max_audio;
+            audio.drain(..excess);
+        }
+
+        // Idle (no caption in progress) and nothing but silence buffered: keep a
+        // short lead-in so the first word is not clipped, but do not accumulate.
+        if stream.is_empty() && !has_recent_speech(&audio, audio.len(), SILENCE_RMS_THRESHOLD) {
+            let keep = (sr * 0.5) as usize;
+            if audio.len() > keep {
+                audio.drain(..audio.len() - keep);
+            }
+            new_since = 0;
+            continue;
+        }
+
+        // Speech over: clear the caption and start fresh for the next utterance.
+        // (Silence is measured in real time, not on the trimmed buffer.)
+        if !stream.is_empty() && silence.silent_for(silence_hold) {
+            if !last_display.is_empty() {
+                last_display.clear();
+                emit_clear(&sink, &translate_slot);
+            }
+            stream.reset();
+            lang.reset_utterance();
+            audio.clear();
+            new_since = 0;
+            continue;
+        }
+
+        let min_len = if stream.is_empty() {
+            cadence.min
+        } else {
+            min_after_commit
+        };
+        if audio.len() < min_len || new_since < cadence.step {
+            continue;
+        }
+        new_since = 0;
+
+        let result = match transcribe_words(&mut state, &audio, lang.current()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("whisper inference error: {e}");
+                continue;
+            }
+        };
+        lang.observe(result.detected_lang, !result.words.is_empty());
+
+        let audio_secs = audio.len() as f32 / sr;
+        let update = stream.update(result.words, audio_secs, &|lo, hi| {
+            find_silent_cut(&audio, lo, hi)
+        });
+        if let Some(cut) = update.cut_secs {
+            let n = ((cut * sr) as usize).min(audio.len());
+            audio.drain(..n);
+        }
+
+        if update.display.is_empty() {
+            if !last_display.is_empty() {
+                last_display.clear();
+                emit_clear(&sink, &translate_slot);
+            }
+        } else if update.display != last_display {
+            last_display = update.display.clone();
+            emit_caption(&sink, &translate_slot, update.display);
+        }
     }
-    let mut last_caption_was_empty = true;
-    // Buffer length right after the previous run, to count newly arrived audio.
+}
+
+/// Cloud ASR: each request is a whole window of audio and returns plain text,
+/// so keep the simple rolling-window behaviour with a coarser cadence.
+#[allow(clippy::too_many_arguments)]
+fn run_cloud_loop(
+    api_key: String,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    level: Arc<Mutex<f32>>,
+    sink: SharedSink,
+    rt: Handle,
+    stop_flag: Arc<AtomicBool>,
+    language: String,
+    translate_slot: Option<Arc<TranslateSlot>>,
+) {
+    let cadence = Cadence::new(false);
+    let silence_hold = (TARGET_SAMPLE_RATE as f32 * SILENCE_HOLD_SECONDS) as usize;
+    let mut last_display = String::new();
     let mut seen_len = 0usize;
     let mut last_level_emit = std::time::Instant::now();
 
@@ -516,18 +940,13 @@ fn run_asr_loop(
         }
 
         let chunk = {
-            let mut buf = match buffer.lock() {
-                Ok(b) => b,
-                Err(_) => continue,
+            let Ok(mut buf) = buffer.lock() else {
+                continue;
             };
             let new_since_last = buf.len().saturating_sub(seen_len);
             if !cadence.ready(buf.len(), new_since_last) {
                 continue;
             }
-            // Always transcribe the most recent window, not the oldest
-            // backlog: if inference is ever slower than real time (bigger
-            // model, slower CPU) captions stay live instead of falling
-            // further behind. The buffer keeps just one window of history.
             let start = buf.len().saturating_sub(cadence.window);
             let chunk: Vec<f32> = buf[start..].to_vec();
             buf.drain(0..start);
@@ -536,69 +955,29 @@ fn run_asr_loop(
         };
 
         if !has_recent_speech(&chunk, silence_hold, SILENCE_RMS_THRESHOLD) {
-            // Speech has stopped (e.g. a paused video) — clear the overlay
-            // instead of leaving the last caption stuck on screen forever.
-            if !last_caption_was_empty {
-                last_caption_was_empty = true;
-                if let Some(slot) = &translate_slot {
-                    slot.clear();
-                }
-                sink.emit(UiEvent::Caption(CaptionEvent::clear(now_ms())));
+            if !last_display.is_empty() {
+                last_display.clear();
+                emit_clear(&sink, &translate_slot);
             }
             continue;
         }
 
-        let text = if let Some(state) = whisper_state.as_mut() {
-            match transcribe_local(state, &chunk, &language) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("whisper inference error: {e}");
-                    continue;
-                }
+        let wav = audio::encode_wav_pcm16(&chunk, TARGET_SAMPLE_RATE);
+        let text = match rt.block_on(cloud::transcribe(&api_key, wav, &language)) {
+            Ok(t) => t.trim().to_string(),
+            Err(e) => {
+                eprintln!("cloud transcription error: {e}");
+                continue;
             }
-        } else if let Some(api_key) = &cloud_asr_key {
-            let wav = audio::encode_wav_pcm16(&chunk, TARGET_SAMPLE_RATE);
-            let lang = language.clone();
-            let key = api_key.clone();
-            match rt.block_on(cloud::transcribe(&key, wav, &lang)) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("cloud transcription error: {e}");
-                    continue;
-                }
-            }
-        } else {
-            continue;
         };
-
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            if !last_caption_was_empty {
-                last_caption_was_empty = true;
-                if let Some(slot) = &translate_slot {
-                    slot.clear();
-                }
-                sink.emit(UiEvent::Caption(CaptionEvent::clear(now_ms())));
+        if text.is_empty() || is_annotation(&text) {
+            if !last_display.is_empty() {
+                last_display.clear();
+                emit_clear(&sink, &translate_slot);
             }
-            continue;
-        }
-        last_caption_was_empty = false;
-        let timestamp = now_ms();
-
-        // Emit the original-language caption immediately rather than
-        // blocking on translation (a cloud round-trip, or the local ONNX
-        // decode loop, which has no KV cache and is easily the single
-        // slowest step in the pipeline). The translation worker thread
-        // fills in `translatedText` with a follow-up event once it's ready.
-        sink.emit(UiEvent::Caption(CaptionEvent {
-            text: text.clone(),
-            translated_text: None,
-            is_final: true,
-            timestamp,
-        }));
-
-        if let Some(slot) = &translate_slot {
-            slot.set(text, timestamp);
+        } else if text != last_display {
+            last_display = text.clone();
+            emit_caption(&sink, &translate_slot, text);
         }
     }
 }
@@ -725,5 +1104,265 @@ mod cadence_tests {
         }
         assert!(audio::rms(&audio) < 0.05);
         assert!(has_recent_speech(&audio, 24_000, SILENCE_RMS_THRESHOLD));
+    }
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    fn tok(t: &str, a: f32, b: f32) -> (String, f32, f32) {
+        (t.to_string(), a, b)
+    }
+
+    #[test]
+    fn tokens_group_into_words_with_spans() {
+        let words = group_tokens(&[
+            tok(" Hel", 0.0, 0.2),
+            tok("lo", 0.2, 0.4),
+            tok(",", 0.4, 0.45),
+            tok(" world", 0.5, 0.9),
+        ]);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, "Hello,");
+        assert_eq!((words[0].t0, words[0].t1), (0.0, 0.45));
+        assert_eq!(words[1].text, "world");
+    }
+
+    #[test]
+    fn cjk_tokens_are_separate_units() {
+        let words = group_tokens(&[tok("字", 0.0, 0.2), tok("幕", 0.2, 0.4)]);
+        assert_eq!(words.len(), 2);
+    }
+
+    #[test]
+    fn annotations_and_special_tokens_are_recognised() {
+        assert!(is_special_token("[_BEG_]"));
+        assert!(is_special_token("<|endoftext|>"));
+        assert!(!is_special_token(" hello"));
+        assert!(is_annotation("[MUSIC]"));
+        assert!(is_annotation(" (applause) "));
+        assert!(!is_annotation("[not closed"));
+        assert!(!is_annotation("real words"));
+    }
+
+    #[test]
+    fn language_lock_needs_two_agreeing_detections() {
+        let mut l = LanguageLock::new("auto");
+        assert_eq!(l.current(), "auto");
+        l.observe(Some("pl".into()), true);
+        assert_eq!(l.current(), "auto");
+        l.observe(Some("ru".into()), true); // flipped: not yet trusted
+        assert_eq!(l.current(), "auto");
+        // alternating detections never lock
+        l.observe(Some("pl".into()), true);
+        assert_eq!(l.current(), "auto");
+        // two in a row lock it
+        let mut l = LanguageLock::new("auto");
+        l.observe(Some("pl".into()), true);
+        l.observe(Some("pl".into()), true);
+        assert_eq!(l.current(), "pl");
+        // later detections do not unlock it mid-utterance
+        l.observe(Some("en".into()), true);
+        assert_eq!(l.current(), "pl");
+        l.reset_utterance();
+        assert_eq!(l.current(), "auto");
+    }
+
+    #[test]
+    fn language_lock_ignores_empty_results_and_fixed_languages() {
+        let mut l = LanguageLock::new("auto");
+        l.observe(Some("pl".into()), false);
+        l.observe(Some("pl".into()), false);
+        assert_eq!(l.current(), "auto");
+        let mut fixed = LanguageLock::new("pl");
+        fixed.observe(Some("en".into()), true);
+        fixed.observe(Some("en".into()), true);
+        assert_eq!(fixed.current(), "pl");
+    }
+}
+
+/// Feeds a WAV into the real local streaming loop in real time and reports how
+/// the captions evolve. Ignored: needs a model and a recording.
+///
+/// `UNICAPTIONS_TEST_WAV=... UNICAPTIONS_TEST_MODEL=<ggml.bin> UNICAPTIONS_TEST_LANG=pl|auto|en \
+///   cargo test --release -p unicaptions-core --lib streaming_timeline -- --ignored --nocapture`
+#[cfg(test)]
+mod streaming_profile {
+    use super::*;
+    use crate::events::FnSink;
+    use std::time::Instant;
+
+    fn read_wav_16k(path: &str) -> Vec<f32> {
+        let bytes = std::fs::read(path).unwrap();
+        let (mut pos, mut rate, mut ch) = (12usize, 0u32, 1u16);
+        let mut data: &[u8] = &[];
+        while pos + 8 <= bytes.len() {
+            let id = &bytes[pos..pos + 4];
+            let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let body = &bytes[pos + 8..(pos + 8 + size).min(bytes.len())];
+            if id == b"fmt " {
+                ch = u16::from_le_bytes(body[2..4].try_into().unwrap());
+                rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            } else if id == b"data" {
+                data = body;
+            }
+            pos += 8 + size + (size & 1);
+        }
+        #[allow(clippy::chunks_exact_to_as_chunks)]
+        let il: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+        audio::resample_linear(&audio::downmix(&il, ch as usize), rate, 16_000)
+    }
+
+    #[test]
+    #[ignore = "profiling aid; needs a model and a wav"]
+    fn streaming_timeline() {
+        let samples = read_wav_16k(&std::env::var("UNICAPTIONS_TEST_WAV").unwrap());
+        let model = std::env::var("UNICAPTIONS_TEST_MODEL").unwrap();
+        let lang = std::env::var("UNICAPTIONS_TEST_LANG").unwrap_or_else(|_| "auto".into());
+
+        let ctx =
+            WhisperContext::new_with_params(&model, WhisperContextParameters::default()).unwrap();
+        let state = ctx.create_state().unwrap();
+
+        let events: Arc<Mutex<Vec<(f32, UiEvent)>>> = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let log = events.clone();
+        let sink: SharedSink = Arc::new(FnSink(move |e| {
+            if matches!(e, UiEvent::Caption(_)) {
+                log.lock().unwrap().push((t0.elapsed().as_secs_f32(), e));
+            }
+        }));
+
+        let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let level = Arc::new(Mutex::new(0.0f32));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (b, l, s, st) = (buffer.clone(), level.clone(), sink.clone(), stop.clone());
+            thread::spawn(move || run_local_loop(state, b, l, s, st, lang, None))
+        };
+
+        // Let the warm-up finish, then stream the recording in real time
+        // (20 ms chunks), followed by 3.5 s of silence.
+        thread::sleep(Duration::from_millis(1500));
+        let feed_start = Instant::now();
+        let mut padded = samples.clone();
+        padded.extend(std::iter::repeat_n(0.0f32, 16_000 * 7 / 2));
+        let t_feed0 = t0.elapsed().as_secs_f32();
+        for (i, chunk) in padded.chunks(320).enumerate() {
+            buffer.lock().unwrap().extend_from_slice(chunk);
+            let due = Duration::from_millis(20 * (i as u64 + 1));
+            if let Some(wait) = due.checked_sub(feed_start.elapsed()) {
+                thread::sleep(wait);
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+
+        let ev = events.lock().unwrap();
+        println!(
+            "audio: {:.1}s speech + 3.5s silence",
+            samples.len() as f32 / 16_000.0
+        );
+        let mut prev = String::new();
+        let (mut revisions, mut regress) = (0, 0);
+        for (t, e) in ev.iter() {
+            let UiEvent::Caption(c) = e else { continue };
+            let rel = t - t_feed0;
+            println!("  +{rel:5.2}s  {:?}", c.text);
+            if !prev.is_empty() && !c.text.is_empty() {
+                revisions += 1;
+                // everything except the last 3 words of the previous caption
+                // must still be a prefix of the new one
+                let words: Vec<&str> = prev.split_whitespace().collect();
+                let stable = words[..words.len().saturating_sub(3)].join(" ");
+                if !c.text.starts_with(&stable) {
+                    regress += 1;
+                    println!("    ^ head changed (expected prefix {stable:?})");
+                }
+            }
+            prev = c.text.clone();
+        }
+        println!("updates: {revisions}, head regressions: {regress}");
+    }
+}
+
+#[cfg(test)]
+mod silence_tests {
+    use super::*;
+
+    /// 16 kHz test signal: `(seconds, loud)` segments.
+    fn signal(segments: &[(f32, bool)]) -> Vec<f32> {
+        let mut out = Vec::new();
+        for (secs, loud) in segments {
+            let n = (secs * 16_000.0) as usize;
+            out.extend((0..n).map(|i| {
+                if *loud {
+                    0.2 * ((i as f32) * 0.3).sin()
+                } else {
+                    0.0
+                }
+            }));
+        }
+        out
+    }
+
+    #[test]
+    fn cut_lands_in_the_silent_gap_not_in_speech() {
+        // speech 0-1 s, gap 1.0-1.4 s, speech 1.4-2.4 s
+        let a = signal(&[(1.0, true), (0.4, false), (1.0, true)]);
+        let cut = find_silent_cut(&a, 0.9, 1.5).expect("gap");
+        assert!(cut > 1.0 && cut < 1.4, "cut = {cut}");
+    }
+
+    #[test]
+    fn no_gap_means_no_cut() {
+        let a = signal(&[(3.0, true)]);
+        assert_eq!(find_silent_cut(&a, 0.5, 2.5), None);
+    }
+
+    #[test]
+    fn gaps_outside_the_allowed_range_are_ignored() {
+        let a = signal(&[(1.0, true), (0.4, false), (3.0, true)]);
+        assert_eq!(find_silent_cut(&a, 2.0, 3.0), None);
+    }
+
+    #[test]
+    fn too_short_a_pause_is_not_a_gap() {
+        let a = signal(&[(1.0, true), (0.04, false), (1.0, true)]);
+        assert_eq!(find_silent_cut(&a, 0.8, 1.3), None);
+    }
+
+    #[test]
+    fn closest_gap_to_the_target_is_chosen() {
+        let a = signal(&[
+            (1.0, true),
+            (0.3, false),
+            (1.0, true),
+            (0.3, false),
+            (1.0, true),
+        ]);
+        let cut = find_silent_cut(&a, 2.0, 2.6).expect("gap");
+        assert!(cut > 2.3 && cut < 2.6, "cut = {cut}");
+    }
+
+    #[test]
+    fn silence_is_tracked_across_pushes_and_reset_by_speech() {
+        let mut t = SilenceTracker::default();
+        let quiet = vec![0.0f32; 400];
+        let loud = vec![0.2f32; 400];
+        for _ in 0..10 {
+            t.push(&quiet, 0.004);
+        }
+        assert!(t.silent_for(4_000));
+        assert!(!t.silent_for(4_001));
+        t.push(&loud, 0.004);
+        assert!(!t.silent_for(1));
+        t.push(&[], 0.004);
+        assert!(!t.silent_for(1));
     }
 }
