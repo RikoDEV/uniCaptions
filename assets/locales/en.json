@@ -69,6 +69,7 @@
     "backgroundOpacity": "Background opacity ({{opacity}}%)",
     "maxLines": "Max visible lines ({{lines}})",
     "textOutline": "Text outline",
+    "uppercase": "Uppercase text",
     "dragHint": "Drag the caption overlay window directly to reposition it, and resize it from its edges. Position and size are saved automatically."
   },
   "translation": {

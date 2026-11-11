@@ -281,6 +281,15 @@ pub struct Layout {
     pub box_size: egui::Vec2,
 }
 
+/// Applies the "uppercase" caption option.
+fn apply_case(text: &str, uppercase: bool) -> String {
+    if uppercase {
+        text.to_uppercase()
+    } else {
+        text.to_string()
+    }
+}
+
 fn compute_layout(
     ctx: &Context,
     view: &CaptionView,
@@ -295,9 +304,10 @@ fn compute_layout(
     let mut blocks: Vec<Block> = Vec::new();
 
     if style.show_original && !view.text.trim().is_empty() {
+        let text = apply_case(view.text.trim(), style.uppercase);
         let g = layout_tail(
             ctx,
-            view.text.trim(),
+            &text,
             font.clone(),
             color,
             max_text_w,
@@ -316,9 +326,10 @@ fn compute_layout(
             .filter(|t| !t.is_empty())
         {
             let tfont = FontId::new(font.size * TRANSLATION_SCALE, caption_family());
+            let tr = apply_case(tr, style.uppercase);
             let g = layout_tail(
                 ctx,
-                tr,
+                &tr,
                 tfont,
                 color.gamma_multiply(TRANSLATION_SCALE),
                 max_text_w,
@@ -556,6 +567,45 @@ mod tests {
             ..style
         };
         assert!(layout_in_pass(&both, &none, 900.0).is_none());
+    }
+
+    #[test]
+    fn apply_case_uppercases_polish_letters() {
+        assert_eq!(apply_case("zażółć gęślą jaźń", true), "ZAŻÓŁĆ GĘŚLĄ JAŹŃ");
+        assert_eq!(apply_case("zażółć", false), "zażółć");
+        assert_eq!(apply_case("", true), "");
+    }
+
+    fn shown_text(view: &CaptionView, style: &CaptionStyle) -> Vec<String> {
+        let ctx = headless_ctx();
+        let mut out = Vec::new();
+        crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
+            let l = compute_layout(ui.ctx(), view, style, 900.0).unwrap();
+            out = l
+                .blocks
+                .iter()
+                .map(|b| b.galley.text().to_string())
+                .collect();
+        });
+        out
+    }
+
+    #[test]
+    fn uppercase_applies_to_the_original_and_the_translation() {
+        let view = CaptionView {
+            text: "dzień dobry".into(),
+            translated: Some("good morning".into()),
+        };
+        let off = shown_text(&view, &CaptionStyle::default());
+        assert_eq!(off, ["dzień dobry", "good morning"]);
+        let on = shown_text(
+            &view,
+            &CaptionStyle {
+                uppercase: true,
+                ..CaptionStyle::default()
+            },
+        );
+        assert_eq!(on, ["DZIEŃ DOBRY", "GOOD MORNING"]);
     }
 
     #[test]

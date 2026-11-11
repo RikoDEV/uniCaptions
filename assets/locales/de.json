@@ -69,6 +69,7 @@
     "backgroundOpacity": "Hintergrundtransparenz ({{opacity}}%)",
     "maxLines": "Maximal sichtbare Zeilen ({{lines}})",
     "textOutline": "Textumriss",
+    "uppercase": "Großbuchstaben",
     "dragHint": "Ziehen Sie das Untertitel-Overlay-Fenster direkt, um es neu zu positionieren, und ändern Sie seine Größe an den Rändern. Position und Größe werden automatisch gespeichert."
   },
   "translation": {

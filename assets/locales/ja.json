@@ -69,6 +69,7 @@
     "backgroundOpacity": "背景の不透明度（{{opacity}}%）",
     "maxLines": "最大表示行数（{{lines}}）",
     "textOutline": "文字の縁取り",
+    "uppercase": "大文字で表示",
     "dragHint": "字幕オーバーレイウィンドウを直接ドラッグして位置を変更し、端からサイズを変更できます。位置とサイズは自動的に保存されます。"
   },
   "translation": {

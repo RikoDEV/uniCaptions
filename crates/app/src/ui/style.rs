@@ -110,6 +110,10 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) {
             widgets::toggle(ui, &pal, &mut cx.settings.caption_style.outline, true);
         });
 
+        row(ui, &cx.t.t("captionStyle.uppercase"), |ui| {
+            widgets::toggle(ui, &pal, &mut cx.settings.caption_style.uppercase, true);
+        });
+
         widgets::hint(ui, &pal, &cx.t.t("captionStyle.dragHint"));
     });
 }

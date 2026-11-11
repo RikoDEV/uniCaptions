@@ -78,6 +78,8 @@ pub struct CaptionStyle {
     pub max_lines: u32,
     pub show_original: bool,
     pub show_translation: bool,
+    /// Show captions in UPPERCASE.
+    pub uppercase: bool,
 }
 
 impl Default for CaptionStyle {
@@ -93,6 +95,7 @@ impl Default for CaptionStyle {
             max_lines: 2,
             show_original: true,
             show_translation: true,
+            uppercase: false,
         }
     }
 }
@@ -346,6 +349,20 @@ mod tests {
         assert_eq!(s.asr_model, WhisperSize::Base);
         assert!(s.click_through);
         assert_eq!(s.target_language, "es");
+    }
+
+    #[test]
+    fn uppercase_defaults_off_and_old_files_still_load() {
+        assert!(!Settings::default().caption_style.uppercase);
+        // a file written before the option existed has no "uppercase" key
+        let old = json!({"captionStyle": {"fontSize": 30}});
+        let s = Settings::from_saved(&old);
+        assert!(!s.caption_style.uppercase);
+        assert_eq!(s.caption_style.font_size, 30.0);
+        let on = Settings::from_saved(&json!({"captionStyle": {"uppercase": true}}));
+        assert!(on.caption_style.uppercase);
+        let v = serde_json::to_value(&on).unwrap();
+        assert_eq!(v["captionStyle"]["uppercase"], true);
     }
 
     #[test]

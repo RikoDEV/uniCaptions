@@ -69,6 +69,7 @@
     "backgroundOpacity": "Opacité du fond ({{opacity}}%)",
     "maxLines": "Lignes visibles max ({{lines}})",
     "textOutline": "Contour du texte",
+    "uppercase": "Texte en majuscules",
     "dragHint": "Faites glisser directement la fenêtre d'incrustation pour la repositionner, et redimensionnez-la depuis ses bords. La position et la taille sont enregistrées automatiquement."
   },
   "translation": {

@@ -69,6 +69,7 @@
     "backgroundOpacity": "背景不透明度（{{opacity}}%）",
     "maxLines": "最大可见行数（{{lines}}）",
     "textOutline": "文字描边",
+    "uppercase": "全部大写",
     "dragHint": "直接拖动字幕悬浮窗以重新定位，并从边缘调整大小。位置和大小会自动保存。"
   },
   "translation": {

@@ -69,6 +69,7 @@
     "backgroundOpacity": "Opacidad de fondo ({{opacity}}%)",
     "maxLines": "Líneas visibles máximas ({{lines}})",
     "textOutline": "Contorno del texto",
+    "uppercase": "Texto en mayúsculas",
     "dragHint": "Arrastra la ventana de subtítulos directamente para reposicionarla y cambia su tamaño desde los bordes. La posición y el tamaño se guardan automáticamente."
   },
   "translation": {

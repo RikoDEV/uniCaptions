@@ -69,6 +69,7 @@
     "backgroundOpacity": "Przezroczystość tła ({{opacity}}%)",
     "maxLines": "Maks. widocznych linii ({{lines}})",
     "textOutline": "Kontur tekstu",
+    "uppercase": "Wielkie litery",
     "dragHint": "Przeciągnij okno nakładki z napisami bezpośrednio, aby zmienić jego położenie, i zmień jego rozmiar, ciągnąc za krawędzie. Pozycja i rozmiar są zapisywane automatycznie."
   },
   "translation": {

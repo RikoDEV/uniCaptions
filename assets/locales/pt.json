@@ -69,6 +69,7 @@
     "backgroundOpacity": "Opacidade do fundo ({{opacity}}%)",
     "maxLines": "Linhas visíveis máximas ({{lines}})",
     "textOutline": "Contorno do texto",
+    "uppercase": "Texto em maiúsculas",
     "dragHint": "Arraste a janela de sobreposição de legendas diretamente para reposicioná-la, e redimensione-a pelas bordas. A posição e o tamanho são salvos automaticamente."
   },
   "translation": {
