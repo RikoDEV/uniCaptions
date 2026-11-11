@@ -174,12 +174,38 @@ impl UniApp {
         // Development aid: show a fixed caption without needing a microphone.
         #[cfg(debug_assertions)]
         if let Ok(text) = std::env::var("UNICAPTIONS_DEMO_CAPTION") {
-            overlay.set_caption(&unicaptions_core::CaptionEvent {
-                text,
-                translated_text: std::env::var("UNICAPTIONS_DEMO_TRANSLATION").ok(),
-                is_final: true,
-                timestamp: 0,
-            });
+            let translated_text = std::env::var("UNICAPTIONS_DEMO_TRANSLATION").ok();
+            // UNICAPTIONS_DEMO_STREAM_MS=N reveals the words one at a time, like live
+            // captions, repeating forever (to look at the word animation).
+            match std::env::var("UNICAPTIONS_DEMO_STREAM_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(ms) => {
+                    let overlay = overlay.clone();
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || loop {
+                        let words: Vec<&str> = text.split(' ').collect();
+                        for n in 1..=words.len() {
+                            overlay.set_caption(&unicaptions_core::CaptionEvent {
+                                text: words[..n].join(" "),
+                                translated_text: None,
+                                is_final: false,
+                                timestamp: 0,
+                            });
+                            ctx.request_repaint_of(overlay_viewport_id());
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(ms * 3));
+                    });
+                }
+                None => overlay.set_caption(&unicaptions_core::CaptionEvent {
+                    text,
+                    translated_text,
+                    is_final: true,
+                    timestamp: 0,
+                }),
+            }
         }
 
         // Development aid: re-show the Settings window after N seconds, through

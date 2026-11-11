@@ -7,7 +7,7 @@
 
 use crate::color::with_alpha;
 use crate::fonts::caption_family;
-use eframe::egui::text::LayoutJob;
+use eframe::egui::text::{CCursor, LayoutJob, TextFormat};
 use eframe::egui::viewport::ResizeDirection;
 use eframe::egui::{
     self, pos2, vec2, Align, Color32, Context, CursorIcon, FontId, Galley, Id, PointerButton, Rect,
@@ -15,6 +15,7 @@ use eframe::egui::{
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use unicaptions_core::settings::{OverlayWindowState, SettingsStore};
 use unicaptions_core::CaptionEvent;
 
@@ -25,6 +26,11 @@ const CORNER_RADIUS: u8 = 10;
 const TRANSLATION_SCALE: f32 = 0.85;
 const TRANSLATION_GAP: f32 = 4.0;
 const RESIZE_BAND: f32 = 8.0;
+/// A new word fades in and slides up from the bottom of its line over this long.
+const WORD_ANIM_SECS: f32 = 0.22;
+/// How far (as a fraction of the line height) a new word starts below its place.
+const WORD_SLIDE: f32 = 0.8;
+const OUTLINE_COLOR: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 150);
 
 pub fn overlay_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("unicaptions-overlay")
@@ -55,20 +61,56 @@ struct CaptionState {
     cleared_at: u128,
     /// Timestamp of the original text the shown translation belongs to.
     translation_at: u128,
+    /// When each word of `view.text` first appeared (for the slide-in animation).
+    births: Vec<(String, Instant)>,
+}
+
+/// A word without case or punctuation, so "żywo" and "Żywo." are the same word.
+fn word_key(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 impl CaptionState {
+    /// Words that continue the previous text keep their birth time; the first
+    /// changed word and everything after it counts as new.
+    fn track_births(&mut self, now: Instant) {
+        let keys: Vec<String> = self.view.text.split_whitespace().map(word_key).collect();
+        let mut kept = 0;
+        while kept < keys.len() && kept < self.births.len() && self.births[kept].0 == keys[kept] {
+            kept += 1;
+        }
+        self.births.truncate(kept);
+        for key in keys.into_iter().skip(kept) {
+            self.births.push((key, now));
+        }
+    }
+
+    /// Seconds since each word of the current text appeared.
+    fn word_ages(&self, now: Instant) -> Vec<f32> {
+        self.births
+            .iter()
+            .map(|(_, born)| now.saturating_duration_since(*born).as_secs_f32())
+            .collect()
+    }
+
     fn apply(&mut self, event: &CaptionEvent) {
         if event.text.is_empty() {
             self.view = CaptionView::default();
             self.cleared_at = event.timestamp;
             self.translation_at = 0;
+            self.births.clear();
             return;
         }
         match &event.translated_text {
             // A new original caption. Keep the current translation (same
             // utterance) so it does not blink off between updates.
-            None => self.view.text = event.text.clone(),
+            None => {
+                self.view.text = event.text.clone();
+                self.track_births(Instant::now());
+            }
             // A translation of an earlier snippet: only ever move forward, and
             // never resurrect text from before the last clear. It does not
             // touch the original text.
@@ -116,10 +158,16 @@ impl OverlayShared {
         }
     }
 
+    #[cfg(test)]
     pub fn caption(&self) -> CaptionView {
+        self.caption_with_ages().0
+    }
+
+    /// The caption and, for each of its words, how long ago it appeared.
+    fn caption_with_ages(&self) -> (CaptionView, Vec<f32>) {
         self.caption
             .lock()
-            .map(|c| c.view.clone())
+            .map(|c| (c.view.clone(), c.word_ages(Instant::now())))
             .unwrap_or_default()
     }
 }
@@ -269,9 +317,154 @@ fn layout_tail(
     layout(ctx, tail.trim_start(), font, color, width, max_rows)
 }
 
+/// A word that is still sliding in.
+struct FreshWord {
+    /// The word on its own, in the normal colour.
+    galley: Arc<Galley>,
+    /// Where it belongs, in the coordinates of the block's galley.
+    at: egui::Vec2,
+    /// The line it sits on (the slide is clipped to it).
+    row: Rect,
+    age: f32,
+}
+
+/// Text laid out so that its newest words can be animated separately.
+struct Words {
+    /// The text with the fresh words invisible (but still taking up their space).
+    galley: Arc<Galley>,
+    /// Same layout with every settled word in the outline colour; only present
+    /// while words are animating (otherwise the plain galley is outlined).
+    outline: Option<Arc<Galley>>,
+    fresh: Vec<FreshWord>,
+}
+
+/// Like [`layout_tail`], but words younger than [`WORD_ANIM_SECS`] are left out of
+/// the drawn text and returned in `fresh`, to be painted sliding in. `ages` holds
+/// one entry per whitespace-separated word of `text` (empty = no animation).
+#[allow(clippy::too_many_arguments)]
+fn layout_words(
+    ctx: &Context,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    outline: Color32,
+    width: f32,
+    max_rows: usize,
+    ages: &[f32],
+) -> Words {
+    let plain = || Words {
+        galley: layout_tail(ctx, text, font.clone(), color, width, max_rows),
+        outline: None,
+        fresh: Vec::new(),
+    };
+    let total = text.split_whitespace().count();
+    if has_cjk(text) || ages.len() != total || !ages.iter().any(|a| *a < WORD_ANIM_SECS) {
+        return plain();
+    }
+
+    // Which part of the text is shown (the last `max_rows` rows)?
+    let max_rows = max_rows.max(1);
+    let full = layout(ctx, text, font.clone(), color, width, usize::MAX);
+    let (tail, skip_words) = if full.rows.len() <= max_rows {
+        (text.to_string(), 0)
+    } else {
+        let skip_rows = full.rows.len() - max_rows;
+        let skip_chars: usize = full.rows[..skip_rows]
+            .iter()
+            .map(|r| r.char_count_including_newline().0)
+            .sum();
+        let skipped: String = text.chars().take(skip_chars).collect();
+        let tail: String = text.chars().skip(skip_chars).collect();
+        (
+            tail.trim_start().to_string(),
+            skipped.split_whitespace().count(),
+        )
+    };
+    let tail_ages = &ages[skip_words.min(ages.len())..];
+
+    // Word boundaries in the tail: (char index, byte range).
+    let mut words: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+    let mut start: Option<(usize, usize)> = None;
+    for (chars_seen, (byte, ch)) in tail.char_indices().enumerate() {
+        if ch.is_whitespace() {
+            if let Some((c, b)) = start.take() {
+                words.push((c, b..byte));
+            }
+        } else if start.is_none() {
+            start = Some((chars_seen, byte));
+        }
+    }
+    if let Some((c, b)) = start {
+        words.push((c, b..tail.len()));
+    }
+    let Some(first_fresh) = tail_ages
+        .iter()
+        .position(|a| *a < WORD_ANIM_SECS)
+        .filter(|i| *i < words.len())
+    else {
+        return plain();
+    };
+    let split = words[first_fresh].1.start;
+
+    let job = |settled: Color32| {
+        let mut job = LayoutJob::default();
+        job.append(
+            &tail[..split],
+            0.0,
+            TextFormat::simple(font.clone(), settled),
+        );
+        job.append(
+            &tail[split..],
+            0.0,
+            TextFormat::simple(font.clone(), Color32::TRANSPARENT),
+        );
+        job.wrap.max_width = width;
+        job.wrap.max_rows = max_rows;
+        job.wrap.overflow_character = Some('\u{2026}');
+        job.halign = Align::LEFT;
+        job
+    };
+    let galley = ctx.fonts_mut(|f| f.layout_job(job(color)));
+    let outline_galley = ctx.fonts_mut(|f| f.layout_job(job(outline)));
+
+    let fresh = words
+        .iter()
+        .enumerate()
+        .skip(first_fresh)
+        .filter_map(|(i, (char_idx, range))| {
+            let spot = galley.pos_from_cursor(CCursor::new(*char_idx));
+            let row = galley
+                .rows
+                .iter()
+                .find(|r| spot.min.y >= r.min_y() - 0.5 && spot.min.y < r.max_y() - 0.5)?
+                .rect();
+            Some(FreshWord {
+                galley: layout(
+                    ctx,
+                    &tail[range.clone()],
+                    font.clone(),
+                    color,
+                    f32::INFINITY,
+                    1,
+                ),
+                at: spot.min.to_vec2(),
+                row,
+                age: *tail_ages.get(i)?,
+            })
+        })
+        .collect();
+    Words {
+        galley,
+        outline: Some(outline_galley),
+        fresh,
+    }
+}
+
 /// One laid-out block (original or translation) at a fixed offset inside the box.
 struct Block {
     galley: Arc<Galley>,
+    outline: Option<Arc<Galley>>,
+    fresh: Vec<FreshWord>,
     /// Distance from the top of the text area (inside the padding).
     y: f32,
 }
@@ -312,6 +505,7 @@ fn compute_layout(
     style: &unicaptions_core::settings::CaptionStyle,
     window_width: f32,
     reserve_translation: bool,
+    ages: &[f32],
 ) -> Option<Layout> {
     let max_text_w = (window_width - 2.0 * OUTER_MARGIN - 2.0 * PAD_X).max(60.0);
     let font = FontId::new(style.font_size.max(6.0), caption_family());
@@ -344,15 +538,22 @@ fn compute_layout(
     let mut y = 0.0f32;
     if show_original_area {
         if let Some(text) = &original {
-            let g = layout_tail(
+            let w = layout_words(
                 ctx,
                 text,
                 font.clone(),
                 color,
+                OUTLINE_COLOR,
                 max_text_w,
                 max_lines as usize,
+                ages,
             );
-            blocks.push(Block { galley: g, y });
+            blocks.push(Block {
+                galley: w.galley,
+                outline: w.outline,
+                fresh: w.fresh,
+                y,
+            });
         }
         y += original_h;
     }
@@ -369,7 +570,12 @@ fn compute_layout(
                 max_text_w,
                 max_lines as usize,
             );
-            blocks.push(Block { galley: g, y });
+            blocks.push(Block {
+                galley: g,
+                outline: None,
+                fresh: Vec::new(),
+                y,
+            });
         }
         y += translation_h;
     }
@@ -385,7 +591,7 @@ fn compute_layout(
 fn render(ui: &mut Ui, shared: &OverlayShared) {
     let ctx = ui.ctx().clone();
     let settings = shared.store.get();
-    let view = shared.caption();
+    let (view, ages) = shared.caption_with_ages();
     let has_text = !view.text.trim().is_empty();
 
     // Windows draws a shadow/border/rounded frame around undecorated windows;
@@ -415,9 +621,13 @@ fn render(ui: &mut Ui, shared: &OverlayShared) {
         .show(ui, |ui| {
             let full = ui.max_rect();
             if has_text {
-                paint_caption(ui, &ctx, &settings, &view, full, !want_passthrough);
+                paint_caption(ui, &ctx, &settings, &view, &ages, full, !want_passthrough);
             }
         });
+    // Keep drawing frames while a word is sliding in.
+    if has_text && ages.iter().any(|a| *a < WORD_ANIM_SECS) {
+        ctx.request_repaint_after(Duration::from_millis(16));
+    }
 
     if let Ok(mut rt) = shared.runtime.lock() {
         crate::window_state::track(&ctx, &mut rt.tracker, &shared.window_file);
@@ -454,12 +664,19 @@ fn paint_caption(
     ctx: &Context,
     settings: &unicaptions_core::Settings,
     view: &CaptionView,
+    ages: &[f32],
     full: Rect,
     interactive: bool,
 ) {
     let style = &settings.caption_style;
-    let Some(layout) = compute_layout(ctx, view, style, full.width(), settings.translation_enabled)
-    else {
+    let Some(layout) = compute_layout(
+        ctx,
+        view,
+        style,
+        full.width(),
+        settings.translation_enabled,
+        ages,
+    ) else {
         return;
     };
 
@@ -473,7 +690,6 @@ fn paint_caption(
 
     let bg = with_alpha(&style.background_color, [0, 0, 0], style.background_opacity);
 
-    let outline = Color32::from_rgba_unmultiplied(0, 0, 0, 150);
     for block in &layout.blocks {
         let g = &block.galley;
         // Left-aligned at a fixed spot, whatever the galley's origin convention.
@@ -488,16 +704,52 @@ fn paint_caption(
             ui.painter()
                 .rect_filled(bar, egui::CornerRadius::same(CORNER_RADIUS), bg);
         }
+        let offsets = [(1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)];
         if style.outline {
-            for (dx, dy) in [(1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)] {
-                ui.painter().galley_with_override_text_color(
-                    pos + vec2(dx, dy),
-                    g.clone(),
-                    outline,
-                );
+            for (dx, dy) in offsets {
+                match &block.outline {
+                    Some(o) => ui
+                        .painter()
+                        .galley(pos + vec2(dx, dy), o.clone(), Color32::WHITE),
+                    None => ui.painter().galley_with_override_text_color(
+                        pos + vec2(dx, dy),
+                        g.clone(),
+                        OUTLINE_COLOR,
+                    ),
+                }
             }
         }
         ui.painter().galley(pos, g.clone(), Color32::WHITE);
+
+        // Words that just arrived rise from the bottom of their line and fade in.
+        for word in &block.fresh {
+            let t = (word.age / WORD_ANIM_SECS).clamp(0.0, 1.0);
+            let eased = 1.0 - (1.0 - t).powi(3);
+            let slide = (1.0 - eased) * WORD_SLIDE * word.row.height();
+            let at = pos + word.at + vec2(0.0, slide) - vec2(0.0, word.galley.rect.top());
+            let clip = Rect::from_min_max(
+                pos2(box_rect.left(), pos.y + word.row.min.y),
+                pos2(box_rect.right(), pos.y + word.row.max.y),
+            );
+            let painter = ui.painter().with_clip_rect(clip);
+            if style.outline {
+                for (dx, dy) in offsets {
+                    painter.add(
+                        egui::epaint::TextShape::new(
+                            at + vec2(dx, dy),
+                            word.galley.clone(),
+                            Color32::WHITE,
+                        )
+                        .with_override_text_color(OUTLINE_COLOR)
+                        .with_opacity_factor(eased),
+                    );
+                }
+            }
+            painter.add(
+                egui::epaint::TextShape::new(at, word.galley.clone(), Color32::WHITE)
+                    .with_opacity_factor(eased),
+            );
+        }
     }
 
     if interactive {
@@ -565,7 +817,7 @@ mod tests {
         let ctx = headless_ctx();
         let mut out = None;
         crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
-            out = compute_layout(ui.ctx(), view, style, width, false).map(|l| l.box_size);
+            out = compute_layout(ui.ctx(), view, style, width, false, &[]).map(|l| l.box_size);
         });
         out
     }
@@ -627,7 +879,7 @@ mod tests {
         let ctx = headless_ctx();
         let mut out = Vec::new();
         crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
-            let l = compute_layout(ui.ctx(), view, style, 900.0, false).unwrap();
+            let l = compute_layout(ui.ctx(), view, style, 900.0, false, &[]).unwrap();
             out = l
                 .blocks
                 .iter()
@@ -686,7 +938,8 @@ mod tests {
             };
             let mut out = None;
             crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
-                out = compute_layout(ui.ctx(), &view, &style, 900.0, reserve).map(|l| l.box_size);
+                out = compute_layout(ui.ctx(), &view, &style, 900.0, reserve, &[])
+                    .map(|l| l.box_size);
             });
             out.unwrap()
         };
@@ -713,7 +966,7 @@ mod tests {
         let mut left = f32::MAX;
         let mut width = 0.0;
         crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
-            let l = compute_layout(ui.ctx(), &view, &style, 900.0, false).unwrap();
+            let l = compute_layout(ui.ctx(), &view, &style, 900.0, false, &[]).unwrap();
             left = l.blocks[0].galley.rect.left();
             width = l.blocks[0].galley.rect.width();
         });
@@ -738,7 +991,7 @@ mod tests {
             };
             let mut out = Vec::new();
             crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
-                let l = compute_layout(ui.ctx(), &view, &style, 900.0, false).unwrap();
+                let l = compute_layout(ui.ctx(), &view, &style, 900.0, false, &[]).unwrap();
                 let g = &l.blocks[0].galley;
                 out = line_bars(g, pos2(PAD_X - g.rect.left(), PAD_Y - g.rect.top()));
             });
@@ -767,6 +1020,102 @@ Second, much longer line of text",
         assert_eq!(two.len(), 2);
         assert!((two[0].bottom() - two[1].top()).abs() < 0.5 + PAD_Y / 2.0);
         assert!(two[1].width() > two[0].width());
+    }
+
+    fn event(text: &str) -> CaptionEvent {
+        CaptionEvent {
+            text: text.into(),
+            translated_text: None,
+            is_final: false,
+            timestamp: 1,
+        }
+    }
+
+    #[test]
+    fn words_keep_their_birth_time_while_the_text_grows() {
+        let mut st = CaptionState::default();
+        st.apply(&event("To jest"));
+        let first = st.births.clone();
+        std::thread::sleep(Duration::from_millis(5));
+        st.apply(&event("To jest test."));
+        assert_eq!(st.births.len(), 3);
+        assert_eq!(st.births[0].1, first[0].1, "old words must not restart");
+        assert_eq!(st.births[1].1, first[1].1);
+        assert!(st.births[2].1 > first[1].1, "only the new word is new");
+        // punctuation and case do not make a word new
+        st.apply(&event("to jest Test"));
+        assert_eq!(st.births.len(), 3);
+        let ages = st.word_ages(Instant::now());
+        assert!(ages[0] >= ages[2]);
+    }
+
+    #[test]
+    fn a_corrected_word_and_what_follows_become_new_again() {
+        let mut st = CaptionState::default();
+        st.apply(&event("na wiosce dzisiaj"));
+        let before = st.births.clone();
+        std::thread::sleep(Duration::from_millis(5));
+        st.apply(&event("na żywo dzisiaj"));
+        assert_eq!(st.births[0].1, before[0].1);
+        assert!(st.births[1].1 > before[1].1);
+        assert!(st.births[2].1 > before[2].1);
+        st.apply(&event(""));
+        assert!(st.births.is_empty());
+    }
+
+    fn words_layout(text: &str, ages: &[f32]) -> (Words, egui::Vec2) {
+        let ctx = headless_ctx();
+        let mut out = None;
+        crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
+            let w = layout_words(
+                ui.ctx(),
+                text,
+                FontId::new(24.0, caption_family()),
+                Color32::WHITE,
+                OUTLINE_COLOR,
+                700.0,
+                2,
+                ages,
+            );
+            let size = w.galley.rect.size();
+            out = Some((w, size));
+        });
+        out.unwrap()
+    }
+
+    #[test]
+    fn fresh_words_are_laid_out_in_place_but_not_drawn_with_the_rest() {
+        let text = "To jest test napisów";
+        let (settled, settled_size) = words_layout(text, &[9.0, 9.0, 9.0, 9.0]);
+        assert!(settled.fresh.is_empty() && settled.outline.is_none());
+        let (anim, anim_size) = words_layout(text, &[9.0, 9.0, 0.05, 0.01]);
+        assert_eq!(anim.fresh.len(), 2);
+        assert_eq!(settled_size, anim_size, "animating must not move anything");
+        let first = &anim.fresh[0];
+        let second = &anim.fresh[1];
+        assert!(first.at.x > 20.0, "after the settled words: {:?}", first.at);
+        assert!(second.at.x > first.at.x);
+        assert!(anim.outline.is_some());
+    }
+
+    #[test]
+    fn fresh_words_on_a_wrapped_line_belong_to_that_line() {
+        let text = format!("{} end", "word ".repeat(40));
+        let n = text.split_whitespace().count();
+        let mut ages = vec![9.0; n];
+        *ages.last_mut().unwrap() = 0.0;
+        let (anim, _) = words_layout(&text, &ages);
+        let word = anim.fresh.last().expect("the last word is fresh");
+        let last_row = anim.galley.rows.last().unwrap().rect();
+        assert!((word.row.min.y - last_row.min.y).abs() < 0.5, "wrong row");
+    }
+
+    #[test]
+    fn cjk_and_mismatched_ages_are_not_animated() {
+        let (w, _) = words_layout("字幕テスト", &[0.0]);
+        assert!(w.fresh.is_empty());
+        let (w, _) = words_layout("two words", &[0.0]);
+        assert!(w.fresh.is_empty(), "ages must match the word count");
     }
 
     #[test]
@@ -909,7 +1258,7 @@ Second, much longer line of text",
         };
         let mut shown = String::new();
         crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
-            let l = compute_layout(ui.ctx(), &view, &style, 700.0, false).unwrap();
+            let l = compute_layout(ui.ctx(), &view, &style, 700.0, false, &[]).unwrap();
             shown = l.blocks[0].galley.text().to_string();
             assert_eq!(l.blocks[0].galley.rows.len(), 2);
         });
