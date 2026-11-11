@@ -30,3 +30,35 @@ pub fn delete(key: &str) -> Result<(), String> {
 pub fn has(key: &str) -> Result<bool, String> {
     Ok(get(key)?.is_some())
 }
+
+/// The cloud services whose API keys we store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiProvider {
+    /// OpenAI Whisper API (cloud speech recognition).
+    OpenAiAsr,
+    /// DeepL API (cloud translation).
+    DeepL,
+}
+
+impl ApiProvider {
+    /// Keyring entry name. Unchanged from the Tauri version so keys saved
+    /// there keep working.
+    pub fn secret_key(self) -> &'static str {
+        match self {
+            ApiProvider::OpenAiAsr => "openai_asr",
+            ApiProvider::DeepL => "deepl_translate",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_keys_match_legacy_names() {
+        assert_eq!(ApiProvider::OpenAiAsr.secret_key(), "openai_asr");
+        assert_eq!(ApiProvider::DeepL.secret_key(), "deepl_translate");
+        assert_eq!(SERVICE, "com.unicaptions.app");
+    }
+}

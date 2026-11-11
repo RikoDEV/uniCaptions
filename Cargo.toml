@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["RikoDEV"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

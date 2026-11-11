@@ -202,3 +202,50 @@ pub fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> 
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downmix_averages_channels() {
+        assert_eq!(downmix(&[1.0, 3.0, 2.0, 4.0], 2), vec![2.0, 3.0]);
+        assert_eq!(downmix(&[0.5, 0.25], 1), vec![0.5, 0.25]);
+        assert_eq!(downmix(&[1.0, 1.0], 0), vec![1.0, 1.0]); // 0 channels treated as mono
+        assert!(downmix(&[], 2).is_empty());
+    }
+
+    #[test]
+    fn rms_of_known_signals() {
+        assert_eq!(rms(&[]), 0.0);
+        assert_eq!(rms(&[0.0; 8]), 0.0);
+        assert!((rms(&[0.5; 100]) - 0.5).abs() < 1e-6);
+        assert!((rms(&[1.0, -1.0, 1.0, -1.0]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resample_changes_length_proportionally() {
+        let input: Vec<f32> = (0..48_000).map(|i| (i as f32 / 100.0).sin()).collect();
+        let out = resample_linear(&input, 48_000, 16_000);
+        assert_eq!(out.len(), 16_000);
+        assert_eq!(resample_linear(&input, 16_000, 16_000), input);
+        assert!(resample_linear(&[], 44_100, 16_000).is_empty());
+        // linear ramp stays a ramp after upsampling
+        let up = resample_linear(&[0.0, 1.0], 1, 2);
+        assert_eq!(up, vec![0.0, 0.5, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn wav_header_and_samples() {
+        let wav = encode_wav_pcm16(&[0.0, 1.0, -1.0, 2.0], 16_000);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 8);
+        assert_eq!(wav.len(), 44 + 8);
+        let s1 = i16::from_le_bytes(wav[46..48].try_into().unwrap());
+        let s3 = i16::from_le_bytes(wav[50..52].try_into().unwrap());
+        assert_eq!(s1, i16::MAX);
+        assert_eq!(s3, i16::MAX); // clamped from 2.0
+    }
+}

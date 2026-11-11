@@ -1,0 +1,9 @@
+[package]
+name = "unicaptions"
+description = "Cross-platform live captions and translation overlay"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+unicaptions-core = { path = "../core" }

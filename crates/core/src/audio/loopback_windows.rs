@@ -62,6 +62,7 @@ where
 
         while sample_queue.len() >= bytes_per_frame {
             let bytes: Vec<u8> = sample_queue.drain(..bytes_per_frame * 512.min(sample_queue.len() / bytes_per_frame).max(1)).collect();
+            #[allow(clippy::chunks_exact_to_as_chunks)]
             let samples: Vec<f32> = bytes
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))

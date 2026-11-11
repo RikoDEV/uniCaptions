@@ -5,7 +5,8 @@ use ort::value::Tensor;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, Manager};
+use crate::events::{EventSink, ModelKind, UiEvent};
+use crate::paths::Paths;
 use tokenizers::Tokenizer;
 
 /// Supported local translation targets: English -> target language, backed by
@@ -35,11 +36,11 @@ pub struct TranslateModelInfo {
     pub bytes_on_disk: u64,
 }
 
-pub fn list_translate_models(app: &AppHandle) -> Result<Vec<TranslateModelInfo>, String> {
+pub fn list_translate_models(paths: &Paths) -> Result<Vec<TranslateModelInfo>, String> {
     supported_targets()
         .iter()
         .map(|&lang| {
-            let dir = model_dir(app, lang)?;
+            let dir = model_dir(paths, lang);
             let mut bytes_on_disk = 0u64;
             let mut downloaded = false;
             if let Ok(entries) = fs::read_dir(&dir) {
@@ -59,8 +60,11 @@ pub fn list_translate_models(app: &AppHandle) -> Result<Vec<TranslateModelInfo>,
         .collect()
 }
 
-pub fn delete_translate_model(app: &AppHandle, lang: &str) -> Result<(), String> {
-    let dir = model_dir(app, lang)?;
+pub fn delete_translate_model(paths: &Paths, lang: &str) -> Result<(), String> {
+    if !is_supported(lang) {
+        return Err(format!("unknown translation language '{lang}'"));
+    }
+    let dir = model_dir(paths, lang);
     if dir.exists() {
         fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
     }
@@ -82,13 +86,12 @@ pub struct Translator {
     config: GenerationConfig,
 }
 
-fn model_dir(app: &AppHandle, lang: &str) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(dir.join("models").join("translate").join(lang))
+fn model_dir(paths: &Paths, lang: &str) -> PathBuf {
+    paths.translate_model_dir(lang)
 }
 
-/// Downloads `url` to `dest`, emitting `translate-model-download-progress`
-/// as `{ lang, progress }` where `progress` is blended across all
+/// Downloads `url` to `dest`, emitting `ModelProgress` for the language
+/// where `progress` is blended across all
 /// `stage_count` files being downloaded for this language (file `stage_index`
 /// of `stage_count`, 0-based), so the UI sees one smooth 0-1 bar rather than
 /// four separate ones.
@@ -96,17 +99,18 @@ fn model_dir(app: &AppHandle, lang: &str) -> Result<PathBuf, String> {
 async fn download_file(
     url: &str,
     dest: &Path,
-    app: &AppHandle,
+    sink: &dyn EventSink,
     lang: &str,
     stage_index: usize,
     stage_count: usize,
 ) -> Result<(), String> {
     let emit_progress = |file_fraction: f64| {
         let overall = (stage_index as f64 + file_fraction) / stage_count as f64;
-        let _ = app.emit(
-            "translate-model-download-progress",
-            serde_json::json!({ "lang": lang, "progress": overall }),
-        );
+        sink.emit(UiEvent::ModelProgress {
+            kind: ModelKind::Translate,
+            id: lang.to_string(),
+            progress: overall,
+        });
     };
 
     if dest.exists() {
@@ -151,16 +155,24 @@ struct ModelFiles {
 }
 
 /// Downloads the encoder/decoder/tokenizer/config for the given target
-/// language if not already present, emitting `translate-model-download-progress`.
-pub async fn ensure_model_downloaded(app: AppHandle, target_lang: String) -> Result<(), String> {
-    download_model_files(&app, &target_lang).await?;
+/// language if not already present, emitting `ModelProgress` events.
+pub async fn ensure_model_downloaded(
+    paths: &Paths,
+    sink: &dyn EventSink,
+    target_lang: &str,
+) -> Result<(), String> {
+    download_model_files(paths, sink, target_lang).await?;
     Ok(())
 }
 
-async fn download_model_files(app: &AppHandle, target_lang: &str) -> Result<ModelFiles, String> {
+async fn download_model_files(
+    paths: &Paths,
+    sink: &dyn EventSink,
+    target_lang: &str,
+) -> Result<ModelFiles, String> {
     let repo = repo_for_target(target_lang)
         .ok_or_else(|| format!("no local translation model available for '{target_lang}'"))?;
-    let dir = model_dir(app, target_lang)?;
+    let dir = model_dir(paths, target_lang);
 
     let base = format!("https://huggingface.co/{repo}/resolve/main");
     let encoder_path = dir.join("encoder_model_int8.onnx");
@@ -176,7 +188,7 @@ async fn download_model_files(app: &AppHandle, target_lang: &str) -> Result<Mode
     download_file(
         &format!("{base}/onnx/encoder_model_int8.onnx"),
         &encoder_path,
-        app,
+        sink,
         target_lang,
         0,
         4,
@@ -185,19 +197,20 @@ async fn download_model_files(app: &AppHandle, target_lang: &str) -> Result<Mode
     download_file(
         &format!("{base}/onnx/decoder_model_merged_int8.onnx"),
         &decoder_path,
-        app,
+        sink,
         target_lang,
         1,
         4,
     )
     .await?;
-    download_file(&format!("{base}/tokenizer.json"), &tokenizer_path, app, target_lang, 2, 4)
+    download_file(&format!("{base}/tokenizer.json"), &tokenizer_path, sink, target_lang, 2, 4)
         .await?;
-    download_file(&format!("{base}/config.json"), &config_path, app, target_lang, 3, 4).await?;
-    let _ = app.emit(
-        "translate-model-download-progress",
-        serde_json::json!({ "lang": target_lang, "progress": 1.0 }),
-    );
+    download_file(&format!("{base}/config.json"), &config_path, sink, target_lang, 3, 4).await?;
+    sink.emit(UiEvent::ModelProgress {
+        kind: ModelKind::Translate,
+        id: target_lang.to_string(),
+        progress: 1.0,
+    });
 
     Ok(ModelFiles {
         encoder_path,
@@ -209,13 +222,17 @@ async fn download_model_files(app: &AppHandle, target_lang: &str) -> Result<Mode
 
 /// Downloads (if needed) and loads the encoder/decoder/tokenizer for the
 /// given target language, ready to translate English text into it.
-pub async fn load_translator(app: AppHandle, target_lang: String) -> Result<Translator, String> {
+pub async fn load_translator(
+    paths: &Paths,
+    sink: &dyn EventSink,
+    target_lang: &str,
+) -> Result<Translator, String> {
     let ModelFiles {
         encoder_path,
         decoder_path,
         tokenizer_path,
         config_path,
-    } = download_model_files(&app, &target_lang).await?;
+    } = download_model_files(paths, sink, target_lang).await?;
 
     let config_json: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(&config_path).map_err(|e| e.to_string())?,
@@ -244,7 +261,7 @@ pub async fn load_translator(app: AppHandle, target_lang: String) -> Result<Tran
         .get("d_model")
         .and_then(|v| v.as_u64())
         .ok_or("config.json missing d_model")? as usize;
-    if num_heads == 0 || d_model % num_heads != 0 {
+    if num_heads == 0 || !d_model.is_multiple_of(num_heads) {
         return Err(format!(
             "invalid decoder dims: d_model={d_model}, num_heads={num_heads}"
         ));
@@ -362,6 +379,7 @@ impl Translator {
         let mut next_input_token = self.config.decoder_start_token_id;
         let mut output_ids: Vec<u32> = Vec::new();
 
+        #[allow(clippy::explicit_counter_loop)]
         for step in 0..MAX_OUTPUT_TOKENS {
             let use_cache_branch = step > 0;
 

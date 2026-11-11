@@ -1,6 +1,8 @@
 mod cloud;
 
 use crate::audio;
+use crate::events::{CaptionEvent, EventSink, ModelKind, SharedSink, UiEvent};
+use crate::paths::Paths;
 use crate::translate::Translator;
 use futures_util::StreamExt;
 use std::fs;
@@ -10,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager};
+use tokio::runtime::Handle;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 const WHISPER_SIZES: [&str; 4] = ["tiny", "base", "small", "medium"];
@@ -39,7 +41,7 @@ pub enum AsrConfig {
 }
 
 pub enum TranslateConfig {
-    Local(Translator),
+    Local(Box<Translator>),
     Cloud { api_key: String, target_lang: String },
     None,
 }
@@ -102,7 +104,8 @@ impl TranslateSlot {
 /// language caption reaching the overlay. Returns `None`/`None` when
 /// translation is disabled, so callers can skip the hand-off entirely.
 fn spawn_translate_worker(
-    app: AppHandle,
+    sink: SharedSink,
+    rt: Handle,
     stop_flag: Arc<AtomicBool>,
     mut translate_config: TranslateConfig,
 ) -> (Option<Arc<TranslateSlot>>, Option<thread::JoinHandle<()>>) {
@@ -151,7 +154,7 @@ fn spawn_translate_worker(
                     }
                 },
                 TranslateConfig::Cloud { api_key, target_lang } => {
-                    match tauri::async_runtime::block_on(crate::translate::cloud::translate(
+                    match rt.block_on(crate::translate::cloud::translate(
                         api_key,
                         &job.text,
                         target_lang,
@@ -167,15 +170,12 @@ fn spawn_translate_worker(
             };
 
             if let Some(translated) = translated {
-                let _ = app.emit(
-                    "caption-update",
-                    serde_json::json!({
-                        "text": job.text,
-                        "translatedText": translated,
-                        "isFinal": true,
-                        "timestamp": job.timestamp,
-                    }),
-                );
+                sink.emit(UiEvent::Caption(CaptionEvent {
+                    text: job.text,
+                    translated_text: Some(translated),
+                    is_final: true,
+                    timestamp: job.timestamp,
+                }));
             }
         })
         .ok();
@@ -202,9 +202,8 @@ fn model_url(size: &str) -> String {
     )
 }
 
-fn model_path(app: &AppHandle, size: &str) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(dir.join("models").join("whisper").join(model_filename(size)))
+fn model_path(paths: &Paths, size: &str) -> PathBuf {
+    paths.whisper_model_file(size)
 }
 
 /// Info about a Whisper model size: whether it's downloaded and its size on disk.
@@ -214,11 +213,11 @@ pub struct WhisperModelInfo {
     pub bytes_on_disk: u64,
 }
 
-pub fn list_whisper_models(app: &AppHandle) -> Result<Vec<WhisperModelInfo>, String> {
+pub fn list_whisper_models(paths: &Paths) -> Result<Vec<WhisperModelInfo>, String> {
     WHISPER_SIZES
         .iter()
         .map(|&size| {
-            let path = model_path(app, size)?;
+            let path = model_path(paths, size);
             let (downloaded, bytes_on_disk) = match fs::metadata(&path) {
                 Ok(meta) => (true, meta.len()),
                 Err(_) => (false, 0),
@@ -232,8 +231,8 @@ pub fn list_whisper_models(app: &AppHandle) -> Result<Vec<WhisperModelInfo>, Str
         .collect()
 }
 
-pub fn delete_whisper_model(app: &AppHandle, size: &str) -> Result<(), String> {
-    let path = model_path(app, validate_size(size)?)?;
+pub fn delete_whisper_model(paths: &Paths, size: &str) -> Result<(), String> {
+    let path = model_path(paths, validate_size(size)?);
     if path.exists() {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
@@ -241,10 +240,14 @@ pub fn delete_whisper_model(app: &AppHandle, size: &str) -> Result<(), String> {
 }
 
 /// Downloads the given Whisper model size on first use, emitting
-/// `model-download-progress` events (0.0-1.0) as it streams.
-pub async fn ensure_model_downloaded(app: AppHandle, size: String) -> Result<PathBuf, String> {
-    let size = validate_size(&size)?.to_string();
-    let path = model_path(&app, &size)?;
+/// `ModelProgress` events (0.0-1.0) as it streams.
+pub async fn ensure_model_downloaded(
+    paths: &Paths,
+    sink: &dyn EventSink,
+    size: &str,
+) -> Result<PathBuf, String> {
+    let size = validate_size(size)?.to_string();
+    let path = model_path(paths, &size);
     if path.exists() {
         return Ok(path);
     }
@@ -271,22 +274,25 @@ pub async fn ensure_model_downloaded(app: AppHandle, size: String) -> Result<Pat
         } else {
             0.0
         };
-        let _ = app.emit(
-            "model-download-progress",
-            serde_json::json!({ "size": size, "progress": progress }),
-        );
+        sink.emit(UiEvent::ModelProgress {
+            kind: ModelKind::Whisper,
+            id: size.clone(),
+            progress,
+        });
     }
     drop(file);
     fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
-    let _ = app.emit(
-        "model-download-progress",
-        serde_json::json!({ "size": size, "progress": 1.0 }),
-    );
+    sink.emit(UiEvent::ModelProgress {
+        kind: ModelKind::Whisper,
+        id: size.clone(),
+        progress: 1.0,
+    });
     Ok(path)
 }
 
 pub fn start_captioning(
-    app: AppHandle,
+    sink: SharedSink,
+    rt: Handle,
     asr_config: AsrConfig,
     language: String,
     translate_config: TranslateConfig,
@@ -325,10 +331,9 @@ pub fn start_captioning(
     })?;
 
     let (translate_slot, translate_worker) =
-        spawn_translate_worker(app.clone(), stop_flag.clone(), translate_config);
+        spawn_translate_worker(sink.clone(), rt.clone(), stop_flag.clone(), translate_config);
 
     let stop_worker = stop_flag.clone();
-    let app_worker = app.clone();
     let worker = thread::Builder::new()
         .name("unicaptions-asr".into())
         .spawn(move || {
@@ -337,7 +342,8 @@ pub fn start_captioning(
                 cloud_asr_key,
                 buffer,
                 level,
-                app_worker,
+                sink,
+                rt,
                 stop_worker,
                 language,
                 translate_slot,
@@ -396,7 +402,8 @@ fn run_asr_loop(
     cloud_asr_key: Option<String>,
     buffer: Arc<Mutex<Vec<f32>>>,
     level: Arc<Mutex<f32>>,
-    app: AppHandle,
+    sink: SharedSink,
+    rt: Handle,
     stop_flag: Arc<AtomicBool>,
     language: String,
     translate_slot: Option<Arc<TranslateSlot>>,
@@ -421,7 +428,7 @@ fn run_asr_loop(
         thread::sleep(Duration::from_millis(100));
 
         if let Ok(lvl) = level.lock() {
-            let _ = app.emit("audio-level", *lvl);
+            sink.emit(UiEvent::AudioLevel(*lvl));
         }
 
         let chunk = {
@@ -460,15 +467,7 @@ fn run_asr_loop(
                 if let Some(slot) = &translate_slot {
                     slot.clear();
                 }
-                let _ = app.emit(
-                    "caption-update",
-                    serde_json::json!({
-                        "text": "",
-                        "translatedText": null,
-                        "isFinal": true,
-                        "timestamp": now_ms(),
-                    }),
-                );
+                sink.emit(UiEvent::Caption(CaptionEvent::clear(now_ms())));
             }
             continue;
         }
@@ -485,7 +484,7 @@ fn run_asr_loop(
             let wav = audio::encode_wav_pcm16(&chunk, TARGET_SAMPLE_RATE);
             let lang = language.clone();
             let key = api_key.clone();
-            match tauri::async_runtime::block_on(cloud::transcribe(&key, wav, &lang)) {
+            match rt.block_on(cloud::transcribe(&key, wav, &lang)) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("cloud transcription error: {e}");
@@ -503,15 +502,7 @@ fn run_asr_loop(
                 if let Some(slot) = &translate_slot {
                     slot.clear();
                 }
-                let _ = app.emit(
-                    "caption-update",
-                    serde_json::json!({
-                        "text": "",
-                        "translatedText": null,
-                        "isFinal": true,
-                        "timestamp": now_ms(),
-                    }),
-                );
+                sink.emit(UiEvent::Caption(CaptionEvent::clear(now_ms())));
             }
             continue;
         }
@@ -523,15 +514,12 @@ fn run_asr_loop(
         // decode loop, which has no KV cache and is easily the single
         // slowest step in the pipeline). The translation worker thread
         // fills in `translatedText` with a follow-up event once it's ready.
-        let _ = app.emit(
-            "caption-update",
-            serde_json::json!({
-                "text": text,
-                "translatedText": null,
-                "isFinal": true,
-                "timestamp": timestamp,
-            }),
-        );
+        sink.emit(UiEvent::Caption(CaptionEvent {
+            text: text.clone(),
+            translated_text: None,
+            is_final: true,
+            timestamp,
+        }));
 
         if let Some(slot) = &translate_slot {
             slot.set(text, timestamp);
@@ -539,7 +527,7 @@ fn run_asr_loop(
     }
 }
 
-fn now_ms() -> u128 {
+pub(crate) fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
