@@ -20,23 +20,41 @@ run on real hardware/OS, not just compiled.
 | NSIS installer via `cargo-packager` | built; contents inspected (not installed) |
 | Release build | 0 % idle CPU, ~113 MB working set |
 
-## macOS and Linux — NOT verified
+## Linux (Debian 13 clone under WSL2 + WSLg) — verified, with caveats
 
-Nothing in this repository has been compiled or run on macOS or Linux. CI
-(`.github/workflows/ci.yml`) is configured for both but has not been executed.
-Specific risks, in order of likelihood:
+Built and run natively in a throwaway clone of a Debian 13 WSL distro (since
+deleted), with the same system packages as CI.
 
-1. **Linux tray** (`crates/app/src/tray.rs`): runs on a dedicated GTK thread;
-   needs `libayatana-appindicator3` + `libxdo` at build time.
-2. **Linux keyring** (`sync-secret-service`): needs a running Secret Service
-   (GNOME Keyring / KWallet) at runtime.
-3. **Packaging** (`cargo packager`): DMG and deb/AppImage config is untested;
-   the release-upload step has never run.
-4. **macOS microphone permission**: `Info.plist` adds
-   `NSMicrophoneUsageDescription`; behaviour untested.
-5. **macOS overlay shadow**: `with_has_shadow(false)` is set but unobserved.
-6. Root viewport is created transparent on non-Windows so the overlay's GL
-   config has an alpha channel; unverified there.
+| Area | Result |
+|---|---|
+| `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace` | pass (78 tests) |
+| Whisper (CPU) and OPUS-MT translation end-to-end tests | pass: correct transcript in ~0.95 s, "Hola, ¿cómo estás hoy?" |
+| Keyring persistence against a real gnome-keyring Secret Service | pass (needs an initialised default collection, as a desktop login provides) |
+| App launch under X11 (WSLg): Settings 900x640 + overlay 900x160 created, stable, ~0 % idle CPU, ~150 MB | verified |
+| `.deb` via `cargo packager`: builds, `apt install` resolves deps, binary + desktop entry + icon installed, launches | verified |
+| AppImage via `cargo packager`: builds (26 MB), launches | verified |
+
+Bugs this found and fixed: Linux CI/release workflows were missing `libssl-dev`
+(needed by `ort-sys`'s build script); `CaptureHandle::from_thread` was dead code
+off Windows (failed `-D warnings`); the `.deb` did not declare runtime libraries
+(`libxkbcommon-x11-0` is dlopen-ed by winit and crashed the app on X11 without it).
+
+Caveats — NOT covered:
+- No real desktop environment: the overlay's `_NET_WM_STATE` showed no "above"
+  flag under WSLg's minimal window manager, so **always-on-top on Linux is unconfirmed**,
+  as are skip-taskbar and click-through (`mousePassthrough`).
+- **Tray:** the GTK tray thread starts and runs, but there was no StatusNotifier
+  host, so the icon/menu/"show settings" were never exercised.
+- Wayland session behaviour (positioning is ignored by Wayland compositors).
+- No microphone / live captioning on Linux.
+- `cargo packager` exits 0 even when AppImage bundling fails; the release
+  workflow relies on `upload-artifact`'s `if-no-files-found: error` to catch that.
+
+## macOS — NOT verified
+
+Nothing has been compiled or run on macOS. CI is configured but has not run.
+Risks: DMG packaging; `NSMicrophoneUsageDescription` handling; `with_has_shadow(false)`;
+transparent root viewport (needed for the overlay's GL alpha); tray on the main thread.
 
 ## Known gaps (not implemented)
 
@@ -50,6 +68,7 @@ Specific risks, in order of likelihood:
 
 ## To finish cross-platform verification
 
-Push the branch (CI runs fmt/clippy/tests on Ubuntu, Windows, macOS), then push
-a `v*` pre-release tag to build installers on all three, and install + launch
-each by hand.
+macOS still needs a real run: push the branch (CI runs fmt/clippy/tests on
+Ubuntu, Windows, macOS) and push a `v*` pre-release tag to build the installers;
+then install + launch on a Mac. On Linux, also try a real desktop session with a
+tray host to confirm the tray, always-on-top and click-through.

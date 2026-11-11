@@ -34,7 +34,7 @@ uniCaptions is a single native Rust binary — no Node.js, no WebView.
 - [Rust](https://rustup.rs/) (stable toolchain)
 - `cmake` and LLVM (`libclang`) — required by `whisper-rs` and `ort` at build time
 - **Windows:** the [Vulkan SDK](https://vulkan.lunarg.com/) (with `glslc`) for GPU-accelerated Whisper. At runtime it falls back to the CPU when no Vulkan device is present.
-- **Linux:** `pkg-config libasound2-dev libdbus-1-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev`
+- **Linux:** `pkg-config libssl-dev libasound2-dev libdbus-1-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev`
 
 ### Development
 

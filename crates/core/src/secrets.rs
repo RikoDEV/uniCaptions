@@ -56,11 +56,17 @@ mod tests {
     use super::*;
 
     /// Guards against the in-memory mock store (keyring 3.x without a platform
-    /// feature): a *new* `Entry` must see what an earlier one saved. Windows
-    /// only: CI macOS keychains are locked and Linux runners have no secret service.
-    #[cfg(windows)]
+    /// feature): a *new* `Entry` must see what an earlier one saved. Always runs
+    /// on Windows; on Linux only with `UNICAPTIONS_TEST_KEYRING=1` (needs a running
+    /// Secret Service such as gnome-keyring); skipped on macOS, whose CI keychains
+    /// are locked.
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn keys_persist_in_the_real_os_credential_store() {
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("UNICAPTIONS_TEST_KEYRING").is_none() {
+            return;
+        }
         let name = format!("unicaptions-test-{}", std::process::id());
         assert_eq!(get(&name).unwrap(), None);
         save(&name, "s3cret-value").unwrap();

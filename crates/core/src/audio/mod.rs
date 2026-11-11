@@ -12,6 +12,8 @@ pub struct CaptureHandle {
 }
 
 impl CaptureHandle {
+    // Only the Windows loopback capture builds handles this way.
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn from_thread(stop_flag: Arc<AtomicBool>, thread: thread::JoinHandle<()>) -> Self {
         Self {
             stop_flag,
