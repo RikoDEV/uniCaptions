@@ -146,10 +146,12 @@ impl UniApp {
         };
 
         // Development aids (debug builds only): pick the initial tab / theme.
-        #[cfg(debug_assertions)]
-        let mut st = UiState::default();
-        #[cfg(not(debug_assertions))]
-        let st = UiState::default();
+        // Mutated afterwards only by the debug-build development aids below.
+        #[allow(unused_mut)]
+        let mut st = UiState {
+            font_notice: notice_for(&font_outcome),
+            ..UiState::default()
+        };
         #[cfg(debug_assertions)]
         {
             use crate::state::Tab;
@@ -168,8 +170,6 @@ impl UniApp {
                 _ => {}
             }
         }
-
-        st.font_notice = notice_for(&font_outcome);
 
         // Development aid: show a fixed caption without needing a microphone.
         #[cfg(debug_assertions)]
