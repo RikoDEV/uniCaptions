@@ -32,7 +32,7 @@ pub fn has(key: &str) -> Result<bool, String> {
 }
 
 /// The cloud services whose API keys we store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ApiProvider {
     /// OpenAI Whisper API (cloud speech recognition).
     OpenAiAsr,

@@ -15,10 +15,15 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Platform default locations (`%APPDATA%\com.unicaptions.app` on
+    /// Platform default locations, or the folder named by `UNICAPTIONS_HOME`
+    /// when that environment variable is set (`%APPDATA%\com.unicaptions.app` on
     /// Windows, `~/Library/Application Support/com.unicaptions.app` on macOS,
     /// `~/.local/share` and `~/.config` on Linux).
     pub fn system() -> Result<Self, String> {
+        // Portable / test override: keep everything under one folder.
+        if let Some(home) = std::env::var_os("UNICAPTIONS_HOME").filter(|v| !v.is_empty()) {
+            return Ok(Self::in_dir(Path::new(&home)));
+        }
         let data = dirs::data_dir().ok_or("could not determine the user data directory")?;
         let config = dirs::config_dir().ok_or("could not determine the user config directory")?;
         Ok(Self::from_dirs(
