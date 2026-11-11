@@ -424,6 +424,31 @@ fn render(ui: &mut Ui, shared: &OverlayShared) {
     }
 }
 
+/// The background bar behind each non-empty text row of a galley drawn at `pos`:
+/// as wide as the row's text plus padding, so the background hugs the words.
+fn line_bars(galley: &Galley, pos: egui::Pos2) -> Vec<Rect> {
+    let rows: Vec<Rect> = galley
+        .rows
+        .iter()
+        .map(|r| r.rect())
+        .filter(|r| r.width() > 0.5)
+        .collect();
+    let last = rows.len().saturating_sub(1);
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            // Rows touch (no overlap, so a translucent background is not doubled);
+            // only the first and last get extra room above and below.
+            let top = if i == 0 { PAD_Y / 2.0 } else { 0.0 };
+            let bottom = if i == last { PAD_Y / 2.0 } else { 0.0 };
+            Rect::from_min_max(
+                pos + r.min.to_vec2() - vec2(PAD_X, top),
+                pos + r.max.to_vec2() + vec2(PAD_X, bottom),
+            )
+        })
+        .collect()
+}
+
 fn paint_caption(
     ui: &mut Ui,
     ctx: &Context,
@@ -447,8 +472,6 @@ fn paint_caption(
     );
 
     let bg = with_alpha(&style.background_color, [0, 0, 0], style.background_opacity);
-    ui.painter()
-        .rect_filled(box_rect, egui::CornerRadius::same(CORNER_RADIUS), bg);
 
     let outline = Color32::from_rgba_unmultiplied(0, 0, 0, 150);
     for block in &layout.blocks {
@@ -458,6 +481,13 @@ fn paint_caption(
             box_rect.left() + PAD_X - g.rect.left(),
             box_rect.top() + PAD_Y + block.y - g.rect.top(),
         );
+        // The background follows the words, YouTube-style: one bar per line that
+        // is exactly as wide as that line. Its left edge and position are fixed,
+        // so it only grows to the right as words arrive.
+        for bar in line_bars(g, pos) {
+            ui.painter()
+                .rect_filled(bar, egui::CornerRadius::same(CORNER_RADIUS), bg);
+        }
         if style.outline {
             for (dx, dy) in [(1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)] {
                 ui.painter().galley_with_override_text_color(
@@ -695,6 +725,48 @@ mod tests {
             width < 300.0,
             "a short word must not be stretched across the box: {width}"
         );
+    }
+
+    #[test]
+    fn the_background_hugs_each_line_and_keeps_its_left_edge() {
+        let ctx = headless_ctx();
+        let style = CaptionStyle::default();
+        let bars = |text: &str| {
+            let view = CaptionView {
+                text: text.into(),
+                translated: None,
+            };
+            let mut out = Vec::new();
+            crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
+                let l = compute_layout(ui.ctx(), &view, &style, 900.0, false).unwrap();
+                let g = &l.blocks[0].galley;
+                out = line_bars(g, pos2(PAD_X - g.rect.left(), PAD_Y - g.rect.top()));
+            });
+            out
+        };
+        let short = bars("Hi");
+        let longer = bars("Hi there, this is a longer caption");
+        assert_eq!(short.len(), 1);
+        assert!(
+            longer[0].width() > short[0].width() + 50.0,
+            "bar must follow the words"
+        );
+        assert!(
+            (short[0].left() - longer[0].left()).abs() < 0.01,
+            "left edge must not move"
+        );
+        assert!(
+            (short[0].top() - longer[0].top()).abs() < 0.01,
+            "top must not move"
+        );
+        // two lines: bars touch, never overlap
+        let two = bars(
+            "First line.
+Second, much longer line of text",
+        );
+        assert_eq!(two.len(), 2);
+        assert!((two[0].bottom() - two[1].top()).abs() < 0.5 + PAD_Y / 2.0);
+        assert!(two[1].width() > two[0].width());
     }
 
     #[test]
