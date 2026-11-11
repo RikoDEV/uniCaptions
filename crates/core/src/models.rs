@@ -35,7 +35,7 @@ pub fn list_models(paths: &Paths) -> Result<Vec<ModelEntry>, String> {
             .into_iter()
             .map(|m| ModelEntry {
                 kind: ModelKind::Translate,
-                id: m.lang,
+                id: m.id,
                 downloaded: m.downloaded,
                 bytes_on_disk: m.bytes_on_disk,
             }),
@@ -86,7 +86,7 @@ mod tests {
         let paths = Paths::in_dir(dir.path());
 
         let all = list_models(&paths).unwrap();
-        assert_eq!(all.len(), 4 + 4);
+        assert_eq!(all.len(), 4 + translate::supported_pairs().len());
         assert!(all.iter().all(|m| !m.downloaded && m.bytes_on_disk == 0));
 
         let whisper = paths.whisper_model_file("tiny");
@@ -94,8 +94,11 @@ mod tests {
         fs::write(&whisper, vec![0u8; 123]).unwrap();
         let tdir = paths.translate_model_dir("de");
         fs::create_dir_all(&tdir).unwrap();
-        fs::write(tdir.join("a.onnx"), vec![0u8; 10]).unwrap();
-        fs::write(tdir.join("b.json"), vec![0u8; 5]).unwrap();
+        // the four files of a complete model: 10 + 3 + 1 + 1 bytes
+        fs::write(tdir.join("encoder_model_int8.onnx"), vec![0u8; 10]).unwrap();
+        fs::write(tdir.join("decoder_model_merged_int8.onnx"), vec![0u8; 3]).unwrap();
+        fs::write(tdir.join("tokenizer.json"), vec![0u8; 1]).unwrap();
+        fs::write(tdir.join("config.json"), vec![0u8; 1]).unwrap();
 
         let all = list_models(&paths).unwrap();
         let tiny = all.iter().find(|m| m.key() == "whisper:tiny").unwrap();
@@ -113,11 +116,31 @@ mod tests {
     }
 
     #[test]
+    fn lists_pair_models_next_to_the_legacy_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let all = list_models(&Paths::in_dir(dir.path())).unwrap();
+        let keys: Vec<String> = all.iter().map(ModelEntry::key).collect();
+        for k in [
+            "translate:es",
+            "translate:zh",
+            "translate:pl-en",
+            "translate:ja-en",
+        ] {
+            assert!(keys.contains(&k.to_string()), "{k} missing in {keys:?}");
+        }
+        assert_eq!(
+            parse_model_key("translate:pl-en").unwrap(),
+            (ModelKind::Translate, "pl-en")
+        );
+    }
+
+    #[test]
     fn rejects_unknown_or_traversal_ids() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::in_dir(dir.path());
         assert!(delete_model(&paths, "whisper:../../evil").is_err());
         assert!(delete_model(&paths, "translate:../x").is_err());
         assert!(delete_model(&paths, "translate:xx").is_err());
+        assert!(delete_model(&paths, "translate:pl-en-evil").is_err());
     }
 }

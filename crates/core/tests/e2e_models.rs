@@ -75,9 +75,10 @@ async fn whisper_tiny_transcribes_synthesized_speech() {
 #[ignore = "downloads the OPUS-MT en->es ONNX model (~250 MB)"]
 async fn local_translation_english_to_spanish() {
     let paths = test_paths();
-    let mut translator = translate::load_translator(&paths, &NullSink, "es")
-        .await
-        .expect("load translator");
+    let mut translator =
+        translate::load_translator(&paths, &NullSink, &translate::Pair::new("en", "es"))
+            .await
+            .expect("load translator");
     let out =
         tokio::task::spawn_blocking(move || translator.translate("Hello, how are you today?"))
             .await
@@ -208,4 +209,64 @@ fn live_pipeline_captions_system_audio_loopback() {
         "no recognisable caption from loopback audio: {captions:?}"
     );
     assert!(ev.contains(&UiEvent::CaptioningStopped));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "downloads the OPUS-MT pl->en ONNX model (~250 MB)"]
+async fn local_translation_polish_to_english_through_the_router() {
+    use std::sync::{Arc, Mutex};
+    use unicaptions_core::events::FnSink;
+    use unicaptions_core::translate::Router;
+    use unicaptions_core::UiEvent;
+
+    let paths = test_paths();
+    let events = Arc::new(Mutex::new(Vec::<UiEvent>::new()));
+    let log = events.clone();
+    let sink: unicaptions_core::SharedSink = Arc::new(FnSink(move |e| log.lock().unwrap().push(e)));
+    let handle = tokio::runtime::Handle::current();
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    let events2 = events.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        // spoken language "auto", target English
+        let mut router = Router::new(
+            paths.clone(),
+            sink.clone(),
+            handle.clone(),
+            lock.clone(),
+            "auto",
+            "en",
+        );
+        // language not detected yet: nothing happens, and nobody is bothered
+        assert_eq!(router.translate("Dzisiaj jest ładna pogoda.", None), None);
+        let polish = router.translate("Dzisiaj jest ładna pogoda i świeci słońce.", Some("pl"));
+        // already English: nothing to translate
+        let same = router.translate("Hello there", Some("en"));
+        // en -> en is a no-op, but a pair with no local model is reported once
+        let mut to_pl = Router::new(paths, sink, handle, lock, "en", "pl");
+        assert_eq!(to_pl.translate("Hello", None), None);
+        assert_eq!(to_pl.translate("Hello again", None), None);
+        (polish, same, events2.lock().unwrap().clone())
+    })
+    .await
+    .unwrap();
+
+    let (polish, same, events) = result;
+    println!("pl->en: {polish:?}");
+    let lower = polish.expect("a translation").to_lowercase();
+    assert!(
+        ["weather", "today", "sun", "shin"]
+            .iter()
+            .any(|w| lower.contains(w)),
+        "does not look like English: {lower:?}"
+    );
+    assert_eq!(same, None);
+    let unavailable = events
+        .iter()
+        .filter(|e| matches!(e, UiEvent::TranslationUnavailable { source, target } if source == "en" && target == "pl"))
+        .count();
+    assert_eq!(
+        unavailable, 1,
+        "an unsupported pair must be reported exactly once: {events:?}"
+    );
 }

@@ -10,6 +10,16 @@ struct DeepLTranslation {
     text: String,
 }
 
+/// DeepL wants regional variants for some targets (plain `EN` / `PT` are
+/// deprecated as *target* languages).
+pub fn deepl_target(lang: &str) -> String {
+    match lang.to_ascii_lowercase().as_str() {
+        "en" => "EN-US".to_string(),
+        "pt" => "PT-PT".to_string(),
+        other => other.to_uppercase(),
+    }
+}
+
 /// Translates text using the DeepL API. Free-tier keys (suffixed `:fx`) use
 /// the free API host; paid keys use the standard host.
 pub async fn translate(api_key: &str, text: &str, target_lang: &str) -> Result<String, String> {
@@ -18,7 +28,7 @@ pub async fn translate(api_key: &str, text: &str, target_lang: &str) -> Result<S
     } else {
         "https://api.deepl.com"
     };
-    let target = target_lang.to_uppercase();
+    let target = deepl_target(target_lang);
 
     let client = reqwest::Client::new();
     let response = client
@@ -44,4 +54,18 @@ pub async fn translate(api_key: &str, text: &str, target_lang: &str) -> Result<S
         .next()
         .map(|t| t.text)
         .ok_or_else(|| "DeepL returned no translation".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deepl_target_codes() {
+        assert_eq!(deepl_target("en"), "EN-US");
+        assert_eq!(deepl_target("pt"), "PT-PT");
+        assert_eq!(deepl_target("pl"), "PL");
+        assert_eq!(deepl_target("zh"), "ZH");
+        assert_eq!(deepl_target("DE"), "DE");
+    }
 }

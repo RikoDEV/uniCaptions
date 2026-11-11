@@ -80,8 +80,8 @@
     "providerCloud": "API en la nube (mayor calidad, requiere clave)",
     "showOriginal": "Mostrar texto original junto a la traducción",
     "deeplKeyLabel": "Clave de API de DeepL",
-    "localUnsupportedHint": "La traducción local actualmente admite español, francés, alemán y chino. Otros idiomas necesitan el proveedor en la nube (próximamente), o se descargará un modelo que puede no existir y los subtítulos mostrarán solo el texto original.",
-    "localAssumptionHint": "La traducción local actualmente asume que el idioma hablado es inglés. La primera vez se descarga un modelo de ~250MB para el idioma de destino seleccionado."
+    "localUnsupportedHint": "La traducción local no admite esta combinación. Funciona del polaco, alemán, español, francés, chino y japonés al inglés, y del inglés al español, francés, alemán y chino (los demás pares entre ellos pasan por el inglés). Para el resto, usa el proveedor en la nube.",
+    "localAssumptionHint": "La primera vez, la traducción local descarga un modelo (unos 250 MB) para cada par de idiomas necesario, según el idioma hablado detectado."
   },
   "languages": {
     "auto": "Detección automática",
@@ -112,7 +112,8 @@
     "download": "Descargar",
     "downloading": "Descargando...",
     "whisperLabel": "Reconocimiento de voz ({{size}})",
-    "translateLabel": "Traducción (inglés -> {{lang}})"
+    "translateLabel": "Traducción (inglés -> {{lang}})",
+    "pairLabel": "Traducción ({{from}} -> {{to}})"
   },
   "about": {
     "createdBy": "Creado por",
@@ -136,7 +137,8 @@
   },
   "errors": {
     "captioningFailed": "Error al iniciar los subtítulos: {{error}}",
-    "generic": "Error: {{error}}"
+    "generic": "Error: {{error}}",
+    "translationUnavailable": "La traducción local de {{from}} a {{to}} no está disponible. Elige el proveedor en la nube u otro idioma."
   },
   "tray": {
     "show": "Mostrar ajustes",

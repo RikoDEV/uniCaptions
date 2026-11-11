@@ -80,8 +80,8 @@
     "providerCloud": "云端 API（质量更高，需要密钥）",
     "showOriginal": "在译文旁显示原文",
     "deeplKeyLabel": "DeepL API 密钥",
-    "localUnsupportedHint": "本地翻译目前支持西班牙语、法语、德语和中文。其他语言需要云端提供方（即将推出），或会下载一个可能不存在的模型，此时字幕将仅显示原文。",
-    "localAssumptionHint": "本地翻译目前假定口语语言为英语。首次使用时会为所选目标语言下载约 250MB 的模型。"
+    "localUnsupportedHint": "本地翻译不支持此语言组合。它支持从波兰语、德语、西班牙语、法语、中文和日语译成英语，以及从英语译成西班牙语、法语、德语和中文（其他语言对经由英语中转）。其他情况请使用云端服务。",
+    "localAssumptionHint": "首次使用时，本地翻译会根据检测到的口语语言，为所需的每个语言对下载模型（约 250 MB）。"
   },
   "languages": {
     "auto": "自动检测",
@@ -112,7 +112,8 @@
     "download": "下载",
     "downloading": "正在下载...",
     "whisperLabel": "语音识别（{{size}}）",
-    "translateLabel": "翻译（英语 -> {{lang}}）"
+    "translateLabel": "翻译（英语 -> {{lang}}）",
+    "pairLabel": "翻译（英语 -> {{lang}}） ({{from}} -> {{to}})"
   },
   "about": {
     "createdBy": "创作者",
@@ -136,7 +137,8 @@
   },
   "errors": {
     "captioningFailed": "字幕启动失败：{{error}}",
-    "generic": "错误：{{error}}"
+    "generic": "错误：{{error}}",
+    "translationUnavailable": "不支持本地翻译：{{from}} → {{to}}。请选择云端服务或其他语言。"
   },
   "tray": {
     "show": "显示设置",

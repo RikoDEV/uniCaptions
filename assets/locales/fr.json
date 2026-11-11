@@ -80,8 +80,8 @@
     "providerCloud": "API cloud (meilleure qualité, clé requise)",
     "showOriginal": "Afficher le texte original à côté de la traduction",
     "deeplKeyLabel": "Clé API DeepL",
-    "localUnsupportedHint": "La traduction locale prend actuellement en charge l'espagnol, le français, l'allemand et le chinois. Les autres langues nécessitent le fournisseur cloud (bientôt disponible), ou téléchargent un modèle qui peut ne pas exister, auquel cas seul le texte original s'affichera.",
-    "localAssumptionHint": "La traduction locale suppose actuellement que la langue parlée est l'anglais. Le premier lancement télécharge un modèle d'environ 250 Mo pour la langue cible sélectionnée."
+    "localUnsupportedHint": "La traduction locale ne prend pas en charge cette combinaison. Elle fonctionne du polonais, de l'allemand, de l'espagnol, du français, du chinois et du japonais vers l'anglais, et de l'anglais vers l'espagnol, le français, l'allemand et le chinois (les autres paires passent par l'anglais). Pour le reste, utilisez le fournisseur cloud.",
+    "localAssumptionHint": "À la première utilisation, la traduction locale télécharge un modèle (environ 250 Mo) pour chaque paire de langues nécessaire, selon la langue parlée détectée."
   },
   "languages": {
     "auto": "Détection automatique",
@@ -112,7 +112,8 @@
     "download": "Télécharger",
     "downloading": "Téléchargement...",
     "whisperLabel": "Reconnaissance vocale ({{size}})",
-    "translateLabel": "Traduction (anglais -> {{lang}})"
+    "translateLabel": "Traduction (anglais -> {{lang}})",
+    "pairLabel": "Traduction ({{from}} -> {{to}})"
   },
   "about": {
     "createdBy": "Créé par",
@@ -136,7 +137,8 @@
   },
   "errors": {
     "captioningFailed": "Échec du sous-titrage : {{error}}",
-    "generic": "Erreur : {{error}}"
+    "generic": "Erreur : {{error}}",
+    "translationUnavailable": "La traduction locale du {{from}} vers {{to}} n’est pas disponible. Choisissez le fournisseur cloud ou une autre langue."
   },
   "tray": {
     "show": "Afficher les paramètres",

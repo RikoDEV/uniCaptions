@@ -4,7 +4,7 @@ pub mod stream;
 use crate::audio;
 use crate::events::{CaptionEvent, EventSink, ModelKind, SharedSink, UiEvent};
 use crate::paths::Paths;
-use crate::translate::Translator;
+use crate::translate::Router;
 use futures_util::StreamExt;
 use std::fs;
 use std::io::Write;
@@ -61,7 +61,7 @@ pub enum AsrConfig {
 }
 
 pub enum TranslateConfig {
-    Local(Box<Translator>),
+    Local(Box<Router>),
     Cloud {
         api_key: String,
         target_lang: String,
@@ -94,6 +94,8 @@ impl CaptioningHandle {
 struct PendingTranslation {
     text: String,
     timestamp: u128,
+    /// Spoken language of `text`, when known.
+    source: Option<String>,
 }
 
 /// Hands the latest untranslated caption off to the translation worker
@@ -107,9 +109,13 @@ struct TranslateSlot {
 }
 
 impl TranslateSlot {
-    fn set(&self, text: String, timestamp: u128) {
+    fn set(&self, text: String, timestamp: u128, source: Option<String>) {
         if let Ok(mut guard) = self.pending.lock() {
-            *guard = Some(PendingTranslation { text, timestamp });
+            *guard = Some(PendingTranslation {
+                text,
+                timestamp,
+                source,
+            });
             self.cvar.notify_one();
         }
     }
@@ -169,13 +175,13 @@ fn spawn_translate_worker(
             };
 
             let translated = match &mut translate_config {
-                TranslateConfig::Local(translator) => match translator.translate(&job.text) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        eprintln!("translation error: {e}");
-                        None
-                    }
-                },
+                TranslateConfig::Local(router) => {
+                    router.translate(&job.text, job.source.as_deref())
+                }
+                TranslateConfig::Cloud {
+                    api_key,
+                    target_lang,
+                } if job.source.as_deref() == Some(target_lang.as_str()) => None,
                 TranslateConfig::Cloud {
                     api_key,
                     target_lang,
@@ -612,6 +618,15 @@ impl LanguageLock {
         }
     }
 
+    /// The spoken language if it is known: the setting, or the locked detection.
+    fn effective(&self) -> Option<String> {
+        if self.auto {
+            self.locked.clone()
+        } else {
+            Some(self.configured.clone())
+        }
+    }
+
     /// A new utterance may be in a different language.
     fn reset_utterance(&mut self) {
         self.locked = None;
@@ -773,7 +788,12 @@ fn emit_clear(sink: &SharedSink, slot: &Option<Arc<TranslateSlot>>) {
     sink.emit(UiEvent::Caption(CaptionEvent::clear(now_ms())));
 }
 
-fn emit_caption(sink: &SharedSink, slot: &Option<Arc<TranslateSlot>>, text: String) {
+fn emit_caption(
+    sink: &SharedSink,
+    slot: &Option<Arc<TranslateSlot>>,
+    text: String,
+    source: Option<String>,
+) {
     let timestamp = now_ms();
     sink.emit(UiEvent::Caption(CaptionEvent {
         text: text.clone(),
@@ -787,6 +807,7 @@ fn emit_caption(sink: &SharedSink, slot: &Option<Arc<TranslateSlot>>, text: Stri
         slot.set(
             StreamState::tail_words(&text, TRANSLATE_TAIL_WORDS),
             timestamp,
+            source,
         );
     }
 }
@@ -905,7 +926,7 @@ fn run_local_loop(
             }
         } else if update.display != last_display {
             last_display = update.display.clone();
-            emit_caption(&sink, &translate_slot, update.display);
+            emit_caption(&sink, &translate_slot, update.display, lang.effective());
         }
     }
 }
@@ -963,12 +984,17 @@ fn run_cloud_loop(
         }
 
         let wav = audio::encode_wav_pcm16(&chunk, TARGET_SAMPLE_RATE);
-        let text = match rt.block_on(cloud::transcribe(&api_key, wav, &language)) {
-            Ok(t) => t.trim().to_string(),
+        let (text, detected) = match rt.block_on(cloud::transcribe(&api_key, wav, &language)) {
+            Ok(t) => (t.text.trim().to_string(), t.language),
             Err(e) => {
                 eprintln!("cloud transcription error: {e}");
                 continue;
             }
+        };
+        let source = if language == "auto" {
+            detected.map(str::to_string)
+        } else {
+            Some(language.clone())
         };
         if text.is_empty() || is_annotation(&text) {
             if !last_display.is_empty() {
@@ -977,7 +1003,7 @@ fn run_cloud_loop(
             }
         } else if text != last_display {
             last_display = text.clone();
-            emit_caption(&sink, &translate_slot, text);
+            emit_caption(&sink, &translate_slot, text, source);
         }
     }
 }
@@ -1170,6 +1196,19 @@ mod word_tests {
     }
 
     #[test]
+    fn effective_language_is_the_setting_or_the_lock() {
+        let mut l = LanguageLock::new("auto");
+        assert_eq!(l.effective(), None);
+        l.observe(Some("pl".into()), true);
+        assert_eq!(l.effective(), None, "one detection is not trusted yet");
+        l.observe(Some("pl".into()), true);
+        assert_eq!(l.effective().as_deref(), Some("pl"));
+        l.reset_utterance();
+        assert_eq!(l.effective(), None);
+        assert_eq!(LanguageLock::new("de").effective().as_deref(), Some("de"));
+    }
+
+    #[test]
     fn language_lock_ignores_empty_results_and_fixed_languages() {
         let mut l = LanguageLock::new("auto");
         l.observe(Some("pl".into()), false);
@@ -1240,9 +1279,39 @@ mod streaming_profile {
         let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
         let level = Arc::new(Mutex::new(0.0f32));
         let stop = Arc::new(AtomicBool::new(false));
+
+        // Optional: translate into UNICAPTIONS_TEST_TARGET with the local models
+        // (needs UNICAPTIONS_TEST_HOME with the model downloaded).
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (slot, translate_handle) = match std::env::var("UNICAPTIONS_TEST_TARGET") {
+            Ok(target) => {
+                let paths = Paths::in_dir(std::path::Path::new(
+                    &std::env::var("UNICAPTIONS_TEST_HOME").unwrap(),
+                ));
+                let router = Router::new(
+                    paths,
+                    sink.clone(),
+                    rt.handle().clone(),
+                    Arc::new(tokio::sync::Mutex::new(())),
+                    &lang,
+                    &target,
+                );
+                spawn_translate_worker(
+                    sink.clone(),
+                    rt.handle().clone(),
+                    stop.clone(),
+                    TranslateConfig::Local(Box::new(router)),
+                )
+            }
+            Err(_) => (None, None),
+        };
         let worker = {
             let (b, l, s, st) = (buffer.clone(), level.clone(), sink.clone(), stop.clone());
-            thread::spawn(move || run_local_loop(state, b, l, s, st, lang, None))
+            thread::spawn(move || run_local_loop(state, b, l, s, st, lang, slot))
         };
 
         // Let the warm-up finish, then stream the recording in real time
@@ -1262,6 +1331,9 @@ mod streaming_profile {
         thread::sleep(Duration::from_millis(500));
         stop.store(true, Ordering::SeqCst);
         worker.join().unwrap();
+        if let Some(h) = translate_handle {
+            h.join().unwrap();
+        }
 
         let ev = events.lock().unwrap();
         println!(
@@ -1273,6 +1345,13 @@ mod streaming_profile {
         for (t, e) in ev.iter() {
             let UiEvent::Caption(c) = e else { continue };
             let rel = t - t_feed0;
+            if c.translated_text.is_some() {
+                println!(
+                    "  +{rel:5.2}s  [translation] {:?}",
+                    c.translated_text.as_deref().unwrap()
+                );
+                continue;
+            }
             println!("  +{rel:5.2}s  {:?}", c.text);
             if !prev.is_empty() && !c.text.is_empty() {
                 revisions += 1;

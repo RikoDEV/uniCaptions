@@ -80,8 +80,8 @@
     "providerCloud": "Cloud-API (höhere Qualität, Schlüssel erforderlich)",
     "showOriginal": "Originaltext neben der Übersetzung anzeigen",
     "deeplKeyLabel": "DeepL-API-Schlüssel",
-    "localUnsupportedHint": "Die lokale Übersetzung unterstützt derzeit Spanisch, Französisch, Deutsch und Chinesisch. Andere Sprachen benötigen den Cloud-Anbieter (demnächst verfügbar) oder laden ein möglicherweise nicht existierendes Modell herunter, wobei die Untertitelung dann nur den Originaltext anzeigt.",
-    "localAssumptionHint": "Die lokale Übersetzung geht derzeit davon aus, dass die gesprochene Sprache Englisch ist. Beim ersten Gebrauch wird ein ~250-MB-Modell für die gewählte Zielsprache heruntergeladen."
+    "localUnsupportedHint": "Die lokale Übersetzung unterstützt diese Kombination nicht. Sie funktioniert aus Polnisch, Deutsch, Spanisch, Französisch, Chinesisch und Japanisch ins Englische sowie aus dem Englischen ins Spanische, Französische, Deutsche und Chinesische (andere Paare daraus laufen über Englisch). Für alles andere den Cloud-Anbieter verwenden.",
+    "localAssumptionHint": "Bei der ersten Nutzung lädt die lokale Übersetzung für jedes benötigte Sprachpaar ein Modell (etwa 250 MB) herunter, abhängig von der erkannten Sprache."
   },
   "languages": {
     "auto": "Automatische Erkennung",
@@ -112,7 +112,8 @@
     "download": "Herunterladen",
     "downloading": "Wird heruntergeladen...",
     "whisperLabel": "Spracherkennung ({{size}})",
-    "translateLabel": "Übersetzung (Englisch -> {{lang}})"
+    "translateLabel": "Übersetzung (Englisch -> {{lang}})",
+    "pairLabel": "Übersetzung ({{from}} -> {{to}})"
   },
   "about": {
     "createdBy": "Erstellt von",
@@ -136,7 +137,8 @@
   },
   "errors": {
     "captioningFailed": "Untertitelung fehlgeschlagen: {{error}}",
-    "generic": "Fehler: {{error}}"
+    "generic": "Fehler: {{error}}",
+    "translationUnavailable": "Die lokale Übersetzung von {{from}} nach {{to}} ist nicht verfügbar. Wähle den Cloud-Anbieter oder eine andere Sprache."
   },
   "tray": {
     "show": "Einstellungen anzeigen",

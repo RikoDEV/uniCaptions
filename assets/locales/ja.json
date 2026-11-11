@@ -80,8 +80,8 @@
     "providerCloud": "クラウドAPI（高品質、キーが必要）",
     "showOriginal": "翻訳と一緒に原文を表示",
     "deeplKeyLabel": "DeepL APIキー",
-    "localUnsupportedHint": "ローカル翻訳は現在、スペイン語、フランス語、ドイツ語、中国語に対応しています。他の言語にはクラウドプロバイダー（近日対応予定）が必要です。または存在しない可能性のあるモデルをダウンロードしようとし、その場合字幕には原文のみが表示されます。",
-    "localAssumptionHint": "ローカル翻訳は現在、話される言語が英語であることを前提としています。初回使用時に選択した対象言語用の約250MBのモデルをダウンロードします。"
+    "localUnsupportedHint": "ローカル翻訳ではこの組み合わせは利用できません。ポーランド語・ドイツ語・スペイン語・フランス語・中国語・日本語から英語へ、および英語からスペイン語・フランス語・ドイツ語・中国語へ翻訳できます（これらのうち他の組み合わせは英語を経由します）。それ以外はクラウドプロバイダーを使用してください。",
+    "localAssumptionHint": "初回使用時、検出された話者の言語に基づき、必要な言語ペアごとにモデル（約 250 MB）をダウンロードします。"
   },
   "languages": {
     "auto": "自動検出",
@@ -112,7 +112,8 @@
     "download": "ダウンロード",
     "downloading": "ダウンロード中...",
     "whisperLabel": "音声認識（{{size}}）",
-    "translateLabel": "翻訳（英語 -> {{lang}}）"
+    "translateLabel": "翻訳（英語 -> {{lang}}）",
+    "pairLabel": "翻訳（英語 -> {{lang}}） ({{from}} -> {{to}})"
   },
   "about": {
     "createdBy": "制作者",
@@ -136,7 +137,8 @@
   },
   "errors": {
     "captioningFailed": "字幕を開始できませんでした：{{error}}",
-    "generic": "エラー：{{error}}"
+    "generic": "エラー：{{error}}",
+    "translationUnavailable": "{{from}}から{{to}}へのローカル翻訳は利用できません。クラウドプロバイダーまたは別の言語を選んでください。"
   },
   "tray": {
     "show": "設定を表示",

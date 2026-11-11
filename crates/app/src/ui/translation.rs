@@ -8,6 +8,19 @@ use unicaptions_core::secrets::ApiProvider;
 use unicaptions_core::settings::Provider;
 use unicaptions_core::Engine;
 
+/// Will local translation be unable to do this combination? With an automatic
+/// spoken language, only the target matters (can *any* language reach it?).
+pub fn local_translation_unsupported(source: &str, target: &str) -> bool {
+    if source == target {
+        return false; // nothing to translate, not an error
+    }
+    if source == "auto" {
+        !unicaptions_core::translate::local_supports_target(target)
+    } else {
+        !Engine::local_translation_available(source, target)
+    }
+}
+
 pub fn draw(ui: &mut Ui, cx: &mut Cx) {
     let pal = cx.pal;
     widgets::panel(ui, &pal, |ui| {
@@ -62,11 +75,34 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) {
 
         if enabled
             && cx.settings.translate_provider == Provider::Local
-            && !Engine::is_translation_supported(&cx.settings.target_language)
+            && local_translation_unsupported(
+                &cx.settings.source_language,
+                &cx.settings.target_language,
+            )
         {
             widgets::hint(ui, &pal, &cx.t.t("translation.localUnsupportedHint"));
         }
 
         widgets::hint(ui, &pal, &cx.t.t("translation.localAssumptionHint"));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_translation_unsupported as unsupported;
+
+    #[test]
+    fn hint_rules() {
+        // the user's case: Polish speech into English works locally
+        assert!(!unsupported("pl", "en"));
+        assert!(!unsupported("auto", "en"));
+        assert!(!unsupported("pl", "de")); // pivot through English
+                                           // no model produces Polish / Portuguese / Japanese
+        assert!(unsupported("en", "pl"));
+        assert!(unsupported("auto", "pl"));
+        assert!(unsupported("de", "pt"));
+        assert!(unsupported("pt", "en"));
+        // same language is not "unsupported"
+        assert!(!unsupported("pl", "pl"));
+    }
 }

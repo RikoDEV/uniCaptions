@@ -60,6 +60,13 @@ pub enum UiEvent {
     CaptioningStarted,
     CaptioningFailed(String),
     CaptioningStopped,
+    /// Local translation cannot do this language combination.
+    TranslationUnavailable {
+        source: String,
+        target: String,
+    },
+    /// Translation failed (model could not be loaded, ...). Captioning goes on.
+    TranslationFailed(String),
 }
 
 pub trait EventSink: Send + Sync {

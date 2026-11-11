@@ -80,8 +80,8 @@
     "providerCloud": "API w chmurze (wyższa jakość, wymaga klucza)",
     "showOriginal": "Pokaż oryginalny tekst obok tłumaczenia",
     "deeplKeyLabel": "Klucz API DeepL",
-    "localUnsupportedHint": "Tłumaczenie lokalne obecnie obsługuje hiszpański, francuski, niemiecki i chiński. Inne języki wymagają dostawcy w chmurze (wkrótce) lub pobierają model, który może nie istnieć, a wtedy napisy pokażą tylko oryginalny tekst.",
-    "localAssumptionHint": "Tłumaczenie lokalne obecnie zakłada, że językiem mówionym jest angielski. Przy pierwszym użyciu pobierany jest model o rozmiarze ~250 MB dla wybranego języka docelowego."
+    "localUnsupportedHint": "Lokalne tłumaczenie nie obsługuje tej kombinacji. Działa z polskiego, niemieckiego, hiszpańskiego, francuskiego, chińskiego i japońskiego na angielski oraz z angielskiego na hiszpański, francuski, niemiecki i chiński (pozostałe pary z tych języków przechodzą przez angielski). W pozostałych przypadkach użyj dostawcy w chmurze.",
+    "localAssumptionHint": "Przy pierwszym użyciu lokalne tłumaczenie pobiera model (około 250 MB) dla każdej potrzebnej pary języków, na podstawie wykrytego języka mowy."
   },
   "languages": {
     "auto": "Wykrywanie automatyczne",
@@ -112,7 +112,8 @@
     "download": "Pobierz",
     "downloading": "Pobieranie...",
     "whisperLabel": "Rozpoznawanie mowy ({{size}})",
-    "translateLabel": "Tłumaczenie (angielski -> {{lang}})"
+    "translateLabel": "Tłumaczenie (angielski -> {{lang}})",
+    "pairLabel": "Tłumaczenie ({{from}} -> {{to}})"
   },
   "about": {
     "createdBy": "Stworzone przez",
@@ -136,7 +137,8 @@
   },
   "errors": {
     "captioningFailed": "Nie udało się uruchomić napisów: {{error}}",
-    "generic": "Błąd: {{error}}"
+    "generic": "Błąd: {{error}}",
+    "translationUnavailable": "Lokalne tłumaczenie z języka: {{from}} na: {{to}} jest niedostępne. Wybierz dostawcę w chmurze lub inny język."
   },
   "tray": {
     "show": "Pokaż ustawienia",

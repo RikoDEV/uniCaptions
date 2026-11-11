@@ -126,6 +126,24 @@ impl UiState {
                 self.progress.clear();
                 self.error = Some(t.tr("errors.captioningFailed", &[("error", e)]));
             }
+            UiEvent::TranslationUnavailable { source, target } => {
+                let name = |code: &str| {
+                    let key = format!("languages.{code}");
+                    let v = t.t(&key);
+                    if v == key {
+                        code.to_string()
+                    } else {
+                        v
+                    }
+                };
+                self.error = Some(t.tr(
+                    "errors.translationUnavailable",
+                    &[("from", &name(source)), ("to", &name(target))],
+                ));
+            }
+            UiEvent::TranslationFailed(e) => {
+                self.error = Some(t.tr("errors.generic", &[("error", e)]));
+            }
             UiEvent::CaptioningStopped => {
                 self.captioning = CaptioningStatus::Idle;
                 self.progress.clear();
@@ -242,6 +260,39 @@ mod tests {
             &t(),
         );
         assert_eq!(st.error.as_deref(), Some("Error: offline"));
+    }
+
+    #[test]
+    fn unavailable_translation_is_explained_with_language_names() {
+        let mut st = UiState::default();
+        st.apply_event(
+            &UiEvent::TranslationUnavailable {
+                source: "en".into(),
+                target: "pl".into(),
+            },
+            &I18n::new("en"),
+        );
+        let msg = st.error.clone().expect("an error is shown");
+        assert!(msg.contains("English") && msg.contains("Polish"), "{msg}");
+        // in Polish, with Polish language names
+        let mut st = UiState::default();
+        st.apply_event(
+            &UiEvent::TranslationUnavailable {
+                source: "pt".into(),
+                target: "auto".into(),
+            },
+            &I18n::new("pl"),
+        );
+        assert!(st.error.unwrap().contains("ortugalski"));
+    }
+
+    #[test]
+    fn translation_failure_shows_the_error() {
+        let mut st = UiState::default();
+        st.apply_event(&UiEvent::TranslationFailed("offline".into()), &t());
+        assert_eq!(st.error.as_deref(), Some("Error: offline"));
+        // captioning itself is not affected
+        assert_eq!(st.captioning, CaptioningStatus::Idle);
     }
 
     #[test]

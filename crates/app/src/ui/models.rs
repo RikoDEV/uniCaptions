@@ -9,10 +9,19 @@ use unicaptions_core::ModelKind;
 pub fn model_label(cx: &Cx, m: &ModelEntry) -> String {
     match m.kind {
         ModelKind::Whisper => cx.t.tr("models.whisperLabel", &[("size", &m.id)]),
-        ModelKind::Translate => {
-            let lang = cx.t.t(&format!("languages.{}", m.id));
-            cx.t.tr("models.translateLabel", &[("lang", &lang)])
-        }
+        ModelKind::Translate => match unicaptions_core::translate::Pair::parse_id(&m.id) {
+            // English -> X keeps its original label.
+            Some(pair) if pair.source == "en" => {
+                let lang = cx.t.t(&format!("languages.{}", pair.target));
+                cx.t.tr("models.translateLabel", &[("lang", &lang)])
+            }
+            Some(pair) => {
+                let from = cx.t.t(&format!("languages.{}", pair.source));
+                let to = cx.t.t(&format!("languages.{}", pair.target));
+                cx.t.tr("models.pairLabel", &[("from", &from), ("to", &to)])
+            }
+            None => m.id.clone(),
+        },
     }
 }
 

@@ -9,62 +9,150 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-/// Supported local translation targets: English -> target language, backed by
-/// Helsinki-NLP's OPUS-MT models (ONNX exports via Xenova). Only language
-/// pairs with a published ONNX export are listed here.
-fn repo_for_target(lang: &str) -> Option<&'static str> {
-    match lang {
-        "es" => Some("Xenova/opus-mt-en-es"),
-        "fr" => Some("Xenova/opus-mt-en-fr"),
-        "de" => Some("Xenova/opus-mt-en-de"),
-        "zh" => Some("Xenova/opus-mt-en-zh"),
-        _ => None,
+/// A translation direction, e.g. Polish -> English.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Pair {
+    pub source: String,
+    pub target: String,
+}
+
+impl Pair {
+    pub fn new(source: &str, target: &str) -> Self {
+        Self {
+            source: source.to_string(),
+            target: target.to_string(),
+        }
+    }
+
+    /// Stable id used in model keys and on disk. English -> X keeps the bare
+    /// target code (`es`) so models downloaded by earlier versions are found;
+    /// every other pair is `source-target` (`pl-en`).
+    pub fn id(&self) -> String {
+        if self.source == "en" {
+            self.target.clone()
+        } else {
+            format!("{}-{}", self.source, self.target)
+        }
+    }
+
+    /// Inverse of [`Pair::id`]; `None` for anything that is not a supported pair.
+    pub fn parse_id(id: &str) -> Option<Pair> {
+        let pair = match id.split_once('-') {
+            Some((s, t)) => Pair::new(s, t),
+            None => Pair::new("en", id),
+        };
+        repo_for_pair(&pair).map(|_| pair)
     }
 }
 
-pub fn is_supported(lang: &str) -> bool {
-    repo_for_target(lang).is_some()
+/// Helsinki-NLP OPUS-MT models with a published ONNX export (via Xenova):
+/// English -> es/fr/de/zh, and pl/de/es/fr/zh/ja -> English. Everything else is
+/// reached by pivoting through English, or needs the cloud provider.
+const DIRECT_PAIRS: [(&str, &str, &str); 10] = [
+    ("en", "es", "Xenova/opus-mt-en-es"),
+    ("en", "fr", "Xenova/opus-mt-en-fr"),
+    ("en", "de", "Xenova/opus-mt-en-de"),
+    ("en", "zh", "Xenova/opus-mt-en-zh"),
+    ("pl", "en", "Xenova/opus-mt-pl-en"),
+    ("de", "en", "Xenova/opus-mt-de-en"),
+    ("es", "en", "Xenova/opus-mt-es-en"),
+    ("fr", "en", "Xenova/opus-mt-fr-en"),
+    ("zh", "en", "Xenova/opus-mt-zh-en"),
+    ("ja", "en", "Xenova/opus-mt-ja-en"),
+];
+
+fn repo_for_pair(pair: &Pair) -> Option<&'static str> {
+    DIRECT_PAIRS
+        .iter()
+        .find(|(s, t, _)| *s == pair.source && *t == pair.target)
+        .map(|(_, _, repo)| *repo)
 }
 
-pub fn supported_targets() -> &'static [&'static str] {
-    &["es", "fr", "de", "zh"]
+/// Every pair with a local model, in display order.
+pub fn supported_pairs() -> Vec<Pair> {
+    DIRECT_PAIRS
+        .iter()
+        .map(|(s, t, _)| Pair::new(s, t))
+        .collect()
+}
+
+/// The models needed to translate `source` -> `target` locally, in order.
+/// `Some(vec![])` means nothing to do (same language); `None` means the
+/// combination is not available locally.
+pub fn plan(source: &str, target: &str) -> Option<Vec<Pair>> {
+    if source == target {
+        return Some(Vec::new());
+    }
+    let direct = Pair::new(source, target);
+    if repo_for_pair(&direct).is_some() {
+        return Some(vec![direct]);
+    }
+    // Pivot through English.
+    let (first, second) = (Pair::new(source, "en"), Pair::new("en", target));
+    if source != "en"
+        && target != "en"
+        && repo_for_pair(&first).is_some()
+        && repo_for_pair(&second).is_some()
+    {
+        return Some(vec![first, second]);
+    }
+    None
+}
+
+/// Can *any* spoken language be translated into `target` locally?
+pub fn local_supports_target(target: &str) -> bool {
+    DIRECT_PAIRS.iter().any(|(_, t, _)| *t == target)
 }
 
 pub struct TranslateModelInfo {
-    pub lang: String,
+    /// [`Pair::id`].
+    pub id: String,
+    pub pair: Pair,
     pub downloaded: bool,
     pub bytes_on_disk: u64,
 }
 
-pub fn list_translate_models(paths: &Paths) -> Result<Vec<TranslateModelInfo>, String> {
-    supported_targets()
-        .iter()
-        .map(|&lang| {
-            let dir = model_dir(paths, lang);
-            let mut bytes_on_disk = 0u64;
-            let mut downloaded = false;
-            if let Ok(entries) = fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata() {
-                        bytes_on_disk += meta.len();
-                        downloaded = true;
-                    }
-                }
-            }
-            Ok(TranslateModelInfo {
-                lang: lang.to_string(),
-                downloaded,
-                bytes_on_disk,
-            })
-        })
-        .collect()
+const MODEL_FILES: [&str; 4] = [
+    "encoder_model_int8.onnx",
+    "decoder_model_merged_int8.onnx",
+    "tokenizer.json",
+    "config.json",
+];
+
+/// A model counts as downloaded only if every required file is present
+/// (older versions stored a different decoder file and half-finished downloads
+/// leave `.part` files, neither of which is usable).
+fn is_complete(dir: &Path) -> bool {
+    MODEL_FILES.iter().all(|f| dir.join(f).is_file())
 }
 
-pub fn delete_translate_model(paths: &Paths, lang: &str) -> Result<(), String> {
-    if !is_supported(lang) {
-        return Err(format!("unknown translation language '{lang}'"));
-    }
-    let dir = model_dir(paths, lang);
+pub fn list_translate_models(paths: &Paths) -> Result<Vec<TranslateModelInfo>, String> {
+    Ok(supported_pairs()
+        .into_iter()
+        .map(|pair| {
+            let dir = pair_dir(paths, &pair);
+            let bytes_on_disk = fs::read_dir(&dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0);
+            TranslateModelInfo {
+                id: pair.id(),
+                downloaded: is_complete(&dir),
+                pair,
+                bytes_on_disk,
+            }
+        })
+        .collect())
+}
+
+pub fn delete_translate_model(paths: &Paths, id: &str) -> Result<(), String> {
+    let pair = Pair::parse_id(id).ok_or_else(|| format!("unknown translation model '{id}'"))?;
+    let dir = pair_dir(paths, &pair);
     if dir.exists() {
         fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
     }
@@ -86,8 +174,8 @@ pub struct Translator {
     config: GenerationConfig,
 }
 
-fn model_dir(paths: &Paths, lang: &str) -> PathBuf {
-    paths.translate_model_dir(lang)
+fn pair_dir(paths: &Paths, pair: &Pair) -> PathBuf {
+    paths.translate_model_dir(&pair.id())
 }
 
 /// Downloads `url` to `dest`, emitting `ModelProgress` for the language
@@ -157,25 +245,32 @@ struct ModelFiles {
     config_path: PathBuf,
 }
 
-/// Downloads the encoder/decoder/tokenizer/config for the given target
-/// language if not already present, emitting `ModelProgress` events.
+/// Downloads the encoder/decoder/tokenizer/config for the given model id
+/// (see [`Pair::id`]) if not already present, emitting `ModelProgress` events.
 pub async fn ensure_model_downloaded(
     paths: &Paths,
     sink: &dyn EventSink,
-    target_lang: &str,
+    id: &str,
 ) -> Result<(), String> {
-    download_model_files(paths, sink, target_lang).await?;
+    let pair = Pair::parse_id(id).ok_or_else(|| format!("unknown translation model '{id}'"))?;
+    download_model_files(paths, sink, &pair).await?;
     Ok(())
 }
 
 async fn download_model_files(
     paths: &Paths,
     sink: &dyn EventSink,
-    target_lang: &str,
+    pair: &Pair,
 ) -> Result<ModelFiles, String> {
-    let repo = repo_for_target(target_lang)
-        .ok_or_else(|| format!("no local translation model available for '{target_lang}'"))?;
-    let dir = model_dir(paths, target_lang);
+    let repo = repo_for_pair(pair).ok_or_else(|| {
+        format!(
+            "no local translation model for {} -> {}",
+            pair.source, pair.target
+        )
+    })?;
+    let id = pair.id();
+    let target_lang = id.as_str();
+    let dir = pair_dir(paths, pair);
 
     let base = format!("https://huggingface.co/{repo}/resolve/main");
     let encoder_path = dir.join("encoder_model_int8.onnx");
@@ -243,14 +338,14 @@ async fn download_model_files(
 pub async fn load_translator(
     paths: &Paths,
     sink: &dyn EventSink,
-    target_lang: &str,
+    pair: &Pair,
 ) -> Result<Translator, String> {
     let ModelFiles {
         encoder_path,
         decoder_path,
         tokenizer_path,
         config_path,
-    } = download_model_files(paths, sink, target_lang).await?;
+    } = download_model_files(paths, sink, pair).await?;
 
     let config_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&config_path).map_err(|e| e.to_string())?)
@@ -520,5 +615,234 @@ impl Translator {
         self.tokenizer
             .decode(&output_ids, true)
             .map_err(|e| e.to_string())
+    }
+}
+
+/// Translates captions locally for whatever language pair is needed: loads the
+/// model(s) on first use (downloading them if necessary), keeps a few in
+/// memory, and reports combinations that are not available instead of silently
+/// doing nothing.
+pub struct Router {
+    paths: Paths,
+    sink: crate::events::SharedSink,
+    rt: tokio::runtime::Handle,
+    /// Serialises downloads with the Models tab and captioning start-up.
+    download_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    target: String,
+    /// The user's spoken-language setting; `auto` means "use what was detected".
+    configured_source: String,
+    loaded: Vec<(Pair, Translator)>,
+    warned: std::collections::HashSet<String>,
+}
+
+/// Models kept in memory at once (a pivot translation needs two).
+const MAX_LOADED: usize = 3;
+
+impl Router {
+    pub fn new(
+        paths: Paths,
+        sink: crate::events::SharedSink,
+        rt: tokio::runtime::Handle,
+        download_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+        configured_source: &str,
+        target: &str,
+    ) -> Self {
+        Self {
+            paths,
+            sink,
+            rt,
+            download_lock,
+            target: target.to_string(),
+            configured_source: configured_source.to_string(),
+            loaded: Vec::new(),
+            warned: Default::default(),
+        }
+    }
+
+    /// The spoken language to translate from: the setting, or the detected one.
+    pub fn resolve_source<'a>(configured: &'a str, detected: Option<&'a str>) -> Option<&'a str> {
+        if configured != "auto" {
+            Some(configured)
+        } else {
+            detected
+        }
+    }
+
+    fn warn_once(&mut self, key: String, event: UiEvent) {
+        if self.warned.insert(key) {
+            self.sink.emit(event);
+        }
+    }
+
+    fn translator(&mut self, pair: &Pair) -> Result<&mut Translator, String> {
+        if let Some(i) = self.loaded.iter().position(|(p, _)| p == pair) {
+            let entry = self.loaded.remove(i);
+            self.loaded.push(entry); // most recently used last
+        } else {
+            let (paths, sink, lock) = (&self.paths, &self.sink, &self.download_lock);
+            let t = self.rt.block_on(async {
+                let _guard = lock.lock().await;
+                load_translator(paths, &**sink, pair).await
+            })?;
+            self.loaded.push((pair.clone(), t));
+            if self.loaded.len() > MAX_LOADED {
+                self.loaded.remove(0);
+            }
+        }
+        Ok(&mut self.loaded.last_mut().expect("just pushed").1)
+    }
+
+    /// Translates `text`. `detected` is the language the recogniser detected,
+    /// used when the spoken-language setting is `auto`. Returns `None` when
+    /// there is nothing to translate or it is not possible (the user is told).
+    pub fn translate(&mut self, text: &str, detected: Option<&str>) -> Option<String> {
+        // Still waiting for language detection: nothing to do yet.
+        let source = Self::resolve_source(&self.configured_source, detected)?.to_string();
+        let target = self.target.clone();
+        let steps = match plan(&source, &target) {
+            Some(steps) => steps,
+            None => {
+                self.warn_once(
+                    format!("{source}>{target}"),
+                    UiEvent::TranslationUnavailable { source, target },
+                );
+                return None;
+            }
+        };
+        if steps.is_empty() {
+            return None; // already in the target language
+        }
+        let mut current = text.to_string();
+        for pair in steps {
+            let key = format!("fail:{}", pair.id());
+            let result = self.translator(&pair).and_then(|t| t.translate(&current));
+            match result {
+                Ok(t) => current = t,
+                Err(e) => {
+                    eprintln!("translation error ({}): {e}", pair.id());
+                    self.warn_once(key, UiEvent::TranslationFailed(e));
+                    return None;
+                }
+            }
+        }
+        Some(current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(plan: Option<Vec<Pair>>) -> Option<Vec<String>> {
+        plan.map(|p| p.iter().map(Pair::id).collect())
+    }
+
+    #[test]
+    fn direct_pairs_need_one_model() {
+        assert_eq!(ids(plan("pl", "en")), Some(vec!["pl-en".into()]));
+        assert_eq!(ids(plan("en", "es")), Some(vec!["es".into()]));
+        assert_eq!(ids(plan("ja", "en")), Some(vec!["ja-en".into()]));
+    }
+
+    #[test]
+    fn other_pairs_pivot_through_english() {
+        assert_eq!(
+            ids(plan("pl", "de")),
+            Some(vec!["pl-en".into(), "de".into()])
+        );
+        assert_eq!(
+            ids(plan("fr", "zh")),
+            Some(vec!["fr-en".into(), "zh".into()])
+        );
+    }
+
+    #[test]
+    fn same_language_needs_nothing() {
+        assert_eq!(plan("pl", "pl"), Some(vec![]));
+        assert_eq!(plan("en", "en"), Some(vec![]));
+    }
+
+    #[test]
+    fn unsupported_combinations_are_reported_as_none() {
+        assert_eq!(plan("en", "pl"), None); // no en->pl model
+        assert_eq!(plan("pt", "en"), None); // no pt->en model
+        assert_eq!(plan("en", "ja"), None);
+        assert_eq!(plan("pl", "pt"), None); // pivot target missing
+        assert_eq!(plan("xx", "en"), None);
+    }
+
+    #[test]
+    fn which_targets_are_reachable_locally() {
+        for t in ["en", "es", "fr", "de", "zh"] {
+            assert!(local_supports_target(t), "{t}");
+        }
+        for t in ["pl", "pt", "ja", "auto"] {
+            assert!(!local_supports_target(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn ids_round_trip_and_keep_the_legacy_english_source_form() {
+        for pair in supported_pairs() {
+            assert_eq!(Pair::parse_id(&pair.id()), Some(pair.clone()), "{pair:?}");
+        }
+        assert_eq!(Pair::new("en", "es").id(), "es");
+        assert_eq!(Pair::new("pl", "en").id(), "pl-en");
+        assert_eq!(Pair::parse_id("es"), Some(Pair::new("en", "es")));
+        assert_eq!(Pair::parse_id("pl-en"), Some(Pair::new("pl", "en")));
+    }
+
+    #[test]
+    fn bad_ids_are_rejected() {
+        for bad in [
+            "", "xx", "../x", "pl-pl", "en-pl", "pl-en-x", "pl-", "-en", "es-en-",
+        ] {
+            assert_eq!(Pair::parse_id(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn source_resolution_prefers_the_setting_over_detection() {
+        assert_eq!(Router::resolve_source("pl", Some("en")), Some("pl"));
+        assert_eq!(Router::resolve_source("auto", Some("de")), Some("de"));
+        assert_eq!(Router::resolve_source("auto", None), None);
+    }
+
+    #[test]
+    fn a_model_is_downloaded_only_when_every_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let model = paths.translate_model_dir("pl-en");
+        fs::create_dir_all(&model).unwrap();
+        // older layout / interrupted download: not usable
+        fs::write(model.join("encoder_model_int8.onnx"), b"x").unwrap();
+        fs::write(model.join("decoder_model_int8.onnx"), b"x").unwrap();
+        fs::write(model.join("decoder_model_merged_int8.onnx.part"), b"x").unwrap();
+        let info = |paths: &Paths| {
+            list_translate_models(paths)
+                .unwrap()
+                .into_iter()
+                .find(|m| m.id == "pl-en")
+                .unwrap()
+        };
+        assert!(!info(&paths).downloaded);
+        assert!(info(&paths).bytes_on_disk > 0);
+        for f in MODEL_FILES {
+            fs::write(model.join(f), b"data").unwrap();
+        }
+        assert!(info(&paths).downloaded);
+    }
+
+    #[test]
+    fn delete_removes_a_pair_directory_and_rejects_bad_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let model = paths.translate_model_dir("pl-en");
+        fs::create_dir_all(&model).unwrap();
+        fs::write(model.join("config.json"), b"{}").unwrap();
+        delete_translate_model(&paths, "pl-en").unwrap();
+        assert!(!model.exists());
+        delete_translate_model(&paths, "pl-en").unwrap(); // already gone
+        assert!(delete_translate_model(&paths, "../evil").is_err());
     }
 }

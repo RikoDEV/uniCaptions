@@ -43,7 +43,7 @@ pub struct Engine {
     generation: Mutex<u64>,
     /// Serialises model downloads so a manual download from the Models tab
     /// can't race with one implicitly triggered by starting captioning.
-    download_lock: tokio::sync::Mutex<()>,
+    download_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// How often the mic-test level meter is allowed to emit.
@@ -64,7 +64,7 @@ impl Engine {
             capture: Mutex::new(None),
             captioning: Mutex::new(CaptioningState::Idle),
             generation: Mutex::new(0),
-            download_lock: tokio::sync::Mutex::new(()),
+            download_lock: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }
 
@@ -116,8 +116,9 @@ impl Engine {
         models::delete_model(&self.paths, key)
     }
 
-    pub fn is_translation_supported(target_lang: &str) -> bool {
-        translate::is_supported(target_lang)
+    /// Can `source` -> `target` be translated with the local models?
+    pub fn local_translation_available(source: &str, target: &str) -> bool {
+        translate::plan(source, target).is_some()
     }
 
     /// Downloads a model in the background. Progress arrives as
@@ -240,14 +241,25 @@ impl Engine {
                     target_lang: lang,
                 }
             }
-            Some(lang) if translate::is_supported(&lang) => {
-                let translator = {
-                    let _guard = self.download_lock.lock().await;
-                    translate::load_translator(&self.paths, &*self.sink, &lang).await?
-                };
-                TranslateConfig::Local(Box::new(translator))
+            Some(lang) => {
+                // Models are loaded lazily for whichever language pair is needed
+                // (the spoken language may only be known once it is detected).
+                if p.language != "auto" && translate::plan(&p.language, &lang).is_none() {
+                    self.sink.emit(UiEvent::TranslationUnavailable {
+                        source: p.language.clone(),
+                        target: lang.clone(),
+                    });
+                }
+                TranslateConfig::Local(Box::new(translate::Router::new(
+                    self.paths.clone(),
+                    self.sink.clone(),
+                    self.rt.handle().clone(),
+                    self.download_lock.clone(),
+                    &p.language,
+                    &lang,
+                )))
             }
-            _ => TranslateConfig::None,
+            None => TranslateConfig::None,
         };
 
         let sink = self.sink.clone();
@@ -317,8 +329,10 @@ mod tests {
         let (engine, _log, _dir) = engine_with_log();
         let models = engine.list_models().unwrap();
         assert!(models.iter().all(|m| !m.downloaded));
-        assert!(Engine::is_translation_supported("es"));
-        assert!(!Engine::is_translation_supported("pl"));
+        assert!(Engine::local_translation_available("en", "es"));
+        assert!(Engine::local_translation_available("pl", "en"));
+        assert!(Engine::local_translation_available("pl", "de")); // via English
+        assert!(!Engine::local_translation_available("en", "pl"));
     }
 
     #[test]

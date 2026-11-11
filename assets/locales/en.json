@@ -80,8 +80,8 @@
     "providerCloud": "Cloud API (higher quality, requires key)",
     "showOriginal": "Show original text alongside translation",
     "deeplKeyLabel": "DeepL API key",
-    "localUnsupportedHint": "Local translation currently supports Spanish, French, German, and Chinese. Other languages need the cloud provider (coming soon), or downloads a model that may not exist and captioning will fall back to showing the original text only.",
-    "localAssumptionHint": "Local translation currently assumes the spoken language is English. On first use it downloads a ~250MB model for the selected target language."
+    "localUnsupportedHint": "Local translation cannot do this combination. It works from Polish, German, Spanish, French, Chinese and Japanese into English, and from English into Spanish, French, German and Chinese (other pairs among these go through English). For anything else, use the cloud provider.",
+    "localAssumptionHint": "On first use, local translation downloads a model (about 250 MB) for each language pair it needs, based on the detected spoken language."
   },
   "languages": {
     "auto": "Auto-detect",
@@ -112,7 +112,8 @@
     "download": "Download",
     "downloading": "Downloading...",
     "whisperLabel": "Speech recognition ({{size}})",
-    "translateLabel": "Translation (English -> {{lang}})"
+    "translateLabel": "Translation (English -> {{lang}})",
+    "pairLabel": "Translation ({{from}} -> {{to}})"
   },
   "about": {
     "createdBy": "Created by",
@@ -136,7 +137,8 @@
   },
   "errors": {
     "captioningFailed": "Captioning failed: {{error}}",
-    "generic": "Error: {{error}}"
+    "generic": "Error: {{error}}",
+    "translationUnavailable": "Local translation from {{from}} to {{to}} is not available. Choose the cloud provider or another language."
   },
   "tray": {
     "show": "Show Settings",
