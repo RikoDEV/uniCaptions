@@ -130,7 +130,8 @@
   },
   "fontPicker": {
     "custom": "Personalizado ({{value}})",
-    "search": "Buscar fuentes instaladas"
+    "search": "Buscar fuentes instaladas",
+    "substituted": "La fuente «{{font}}» no tiene todas las letras, así que los subtítulos usan «{{fallback}}»."
   },
   "errors": {
     "captioningFailed": "Error al iniciar los subtítulos: {{error}}",

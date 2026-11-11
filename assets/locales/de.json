@@ -130,7 +130,8 @@
   },
   "fontPicker": {
     "custom": "Benutzerdefiniert ({{value}})",
-    "search": "Installierte Schriften durchsuchen"
+    "search": "Installierte Schriften durchsuchen",
+    "substituted": "Die Schrift „{{font}}“ enthält nicht alle Buchstaben, daher verwenden die Untertitel „{{fallback}}“."
   },
   "errors": {
     "captioningFailed": "Untertitelung fehlgeschlagen: {{error}}",

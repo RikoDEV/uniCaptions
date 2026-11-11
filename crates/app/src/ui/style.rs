@@ -28,6 +28,13 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) {
             if let Some(family) = font_picker::draw(ui, cx) {
                 cx.settings.caption_style.font_family = family;
             }
+            if let Some((requested, using)) = &cx.st.font_notice {
+                let msg = cx.t.tr(
+                    "fontPicker.substituted",
+                    &[("font", requested), ("fallback", using)],
+                );
+                widgets::hint(ui, &pal, &msg);
+            }
         });
 
         let size_label = cx.t.tr(

@@ -59,6 +59,16 @@ fn tray_labels(t: &I18n) -> TrayLabels {
     }
 }
 
+/// `(requested, used)` when the chosen caption font had to be replaced.
+fn notice_for(outcome: &crate::fonts::FontOutcome) -> Option<(String, String)> {
+    match outcome {
+        crate::fonts::FontOutcome::Substituted { requested, using } => {
+            Some((requested.clone(), using.clone()))
+        }
+        _ => None,
+    }
+}
+
 pub struct UniApp {
     engine: Arc<Engine>,
     store: Arc<SettingsStore>,
@@ -106,7 +116,7 @@ impl UniApp {
             FontCatalog::spawn(move || ctx.request_repaint_of(ViewportId::ROOT))
         };
         let style = &settings.caption_style;
-        apply_caption_font(&ctx, &fonts, &style.font_family, style.font_weight);
+        let font_outcome = apply_caption_font(&ctx, &fonts, &style.font_family, style.font_weight);
         let applied_font = AppliedFont {
             family: style.font_family.clone(),
             weight: style.font_weight,
@@ -158,6 +168,8 @@ impl UniApp {
                 _ => {}
             }
         }
+
+        st.font_notice = notice_for(&font_outcome);
 
         // Development aid: show a fixed caption without needing a microphone.
         #[cfg(debug_assertions)]
@@ -230,7 +242,8 @@ impl UniApp {
             catalog_ready: self.fonts.is_ready(),
         };
         if want != self.applied_font {
-            apply_caption_font(ctx, &self.fonts, &want.family, want.weight);
+            let outcome = apply_caption_font(ctx, &self.fonts, &want.family, want.weight);
+            self.st.font_notice = notice_for(&outcome);
             self.applied_font = want;
             ctx.request_repaint_of(overlay_viewport_id());
         }

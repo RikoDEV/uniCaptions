@@ -5826,6 +5826,7 @@ dependencies = [
  "objc2 0.6.5",
  "serde_json",
  "single-instance",
+ "skrifa",
  "tempfile",
  "tray-icon",
  "unicaptions-core",

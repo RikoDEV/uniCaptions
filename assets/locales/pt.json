@@ -130,7 +130,8 @@
   },
   "fontPicker": {
     "custom": "Personalizada ({{value}})",
-    "search": "Pesquisar fontes instaladas"
+    "search": "Pesquisar fontes instaladas",
+    "substituted": "A fonte «{{font}}» não tem todas as letras, por isso as legendas usam «{{fallback}}»."
   },
   "errors": {
     "captioningFailed": "Falha nas legendas: {{error}}",

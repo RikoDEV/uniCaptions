@@ -130,7 +130,8 @@
   },
   "fontPicker": {
     "custom": "Personnalisé ({{value}})",
-    "search": "Rechercher une police installée"
+    "search": "Rechercher une police installée",
+    "substituted": "La police « {{font}} » ne contient pas toutes les lettres ; les sous-titres utilisent « {{fallback}} »."
   },
   "errors": {
     "captioningFailed": "Échec du sous-titrage : {{error}}",

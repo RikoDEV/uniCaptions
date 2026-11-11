@@ -130,7 +130,8 @@
   },
   "fontPicker": {
     "custom": "自定义（{{value}}）",
-    "search": "搜索已安装的字体"
+    "search": "搜索已安装的字体",
+    "substituted": "字体“{{font}}”缺少部分字母，因此字幕改用“{{fallback}}”。"
   },
   "errors": {
     "captioningFailed": "字幕启动失败：{{error}}",

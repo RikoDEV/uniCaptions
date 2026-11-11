@@ -128,6 +128,18 @@ fn ends_sentence(word: &str) -> bool {
     })
 }
 
+/// A word that really ends a sentence. Short tokens such as "p.", "1." or
+/// "Dr." (abbreviations, list numbers) do not count.
+fn is_sentence_break(word: &str) -> bool {
+    if !ends_sentence(word) {
+        return false;
+    }
+    let letters = word.chars().filter(|c| c.is_alphabetic()).count();
+    // CJK sentences are short in characters; one is enough there.
+    let min = if word.chars().any(is_cjk) { 1 } else { 3 };
+    letters >= min
+}
+
 fn lowercase_first(word: &str) -> String {
     let mut chars = word.chars();
     match chars.next() {
@@ -156,9 +168,23 @@ impl StreamState {
         self.committed.is_empty() && self.prev.is_empty()
     }
 
+    /// Joins words into caption text. A finished sentence is followed by a line
+    /// break, so the next sentence starts on a new line (live-caption style).
     fn join(&self, words: impl Iterator<Item = String>) -> String {
-        let sep = if self.spaceless { "" } else { " " };
-        words.collect::<Vec<_>>().join(sep)
+        let mut out = String::new();
+        let mut prev: Option<String> = None;
+        for word in words {
+            if let Some(p) = &prev {
+                if is_sentence_break(p) {
+                    out.push('\n');
+                } else if !self.spaceless {
+                    out.push(' ');
+                }
+            }
+            out.push_str(&word);
+            prev = Some(word);
+        }
+        out
     }
 
     /// Feed the latest hypothesis for the current audio window (`audio_secs` long).
@@ -496,6 +522,51 @@ mod tests {
         assert!(ends_sentence("co?"));
         assert!(!ends_sentence("test,"));
         assert!(!ends_sentence("test"));
+    }
+
+    #[test]
+    fn a_finished_sentence_starts_the_next_line() {
+        let mut s = StreamState::new();
+        let u = s.update(words("to jest test. Dzisiaj jest ładnie"), 3.0, &mid);
+        assert_eq!(u.display, "to jest test.\nDzisiaj jest ładnie");
+    }
+
+    #[test]
+    fn abbreviations_and_numbers_do_not_break_the_line() {
+        let mut s = StreamState::new();
+        let u = s.update(words("pan dr. Kowalski kupił 3. książkę"), 3.0, &mid);
+        assert_eq!(u.display, "pan dr. Kowalski kupił 3. książkę");
+    }
+
+    #[test]
+    fn questions_and_exclamations_also_end_a_line() {
+        let mut s = StreamState::new();
+        let u = s.update(words("co robisz? nic! dobrze"), 2.0, &mid);
+        assert_eq!(u.display, "co robisz?\nnic!\ndobrze");
+    }
+
+    #[test]
+    fn line_breaks_survive_commits_and_never_double_up() {
+        let mut s = StreamState::new();
+        s.update(words("to jest test. Dzisiaj"), 2.0, &mid);
+        // agreement commits "to jest test. Dzisiaj" and cuts the audio
+        s.update(words("to jest test. Dzisiaj jest"), 2.4, &mid);
+        assert_eq!(s.committed.len(), 4);
+        // ...so the next window only contains the words after the cut
+        let u = s.update(words("jest ładnie"), 1.0, &mid);
+        assert_eq!(u.display, "to jest test.\nDzisiaj jest ładnie");
+        assert_eq!(u.display.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn cjk_sentences_break_without_spaces() {
+        let mut s = StreamState::new();
+        let u = s.update(
+            vec![Word::new("字幕。", 0.0, 0.5), Word::new("テスト", 0.5, 1.0)],
+            1.0,
+            &mid,
+        );
+        assert_eq!(u.display, "字幕。\nテスト");
     }
 
     #[test]

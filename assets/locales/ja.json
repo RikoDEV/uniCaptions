@@ -130,7 +130,8 @@
   },
   "fontPicker": {
     "custom": "カスタム（{{value}}）",
-    "search": "インストール済みフォントを検索"
+    "search": "インストール済みフォントを検索",
+    "substituted": "フォント「{{font}}」には一部の文字がないため、字幕には「{{fallback}}」を使用します。"
   },
   "errors": {
     "captioningFailed": "字幕を開始できませんでした：{{error}}",

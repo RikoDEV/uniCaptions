@@ -648,13 +648,13 @@ impl SilenceTracker {
 /// Returns the middle of the silent run closest to the middle of the range.
 fn find_silent_cut(audio: &[f32], lo: f32, hi: f32) -> Option<f32> {
     const FRAME: usize = 320; // 20 ms
-    const MIN_RUN: usize = 4; // 80 ms of silence
+    const MIN_RUN: usize = 6; // 120 ms of silence: shorter dips occur inside words (stop consonants)
     let sr = TARGET_SAMPLE_RATE as f32;
     if audio.len() < FRAME * MIN_RUN || hi < lo {
         return None;
     }
     // "Silent" relative to this window, so a noisy room still has gaps.
-    let threshold = (audio::rms(audio) * 0.25).max(0.003);
+    let threshold = (audio::rms(audio) * 0.15).max(0.003);
     let silent: Vec<bool> = audio
         .chunks(FRAME)
         .map(|f| audio::rms(f) < threshold)
@@ -1335,6 +1335,16 @@ mod silence_tests {
     fn too_short_a_pause_is_not_a_gap() {
         let a = signal(&[(1.0, true), (0.04, false), (1.0, true)]);
         assert_eq!(find_silent_cut(&a, 0.8, 1.3), None);
+    }
+
+    #[test]
+    fn a_100ms_dip_inside_a_word_is_not_a_cut_point() {
+        // stop consonants leave ~100 ms near-silences inside words
+        let a = signal(&[(1.0, true), (0.1, false), (1.0, true)]);
+        assert_eq!(find_silent_cut(&a, 0.8, 1.3), None);
+        // a real pause of 150 ms is
+        let b = signal(&[(1.0, true), (0.15, false), (1.0, true)]);
+        assert!(find_silent_cut(&b, 0.8, 1.3).is_some());
     }
 
     #[test]

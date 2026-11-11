@@ -47,6 +47,54 @@ pub struct FontCatalog {
 pub struct FoundFace {
     pub data: Vec<u8>,
     pub index: u32,
+    /// Contains every letter the app's languages need (see [`REQUIRED_TEXT`]).
+    pub complete: bool,
+}
+
+/// Letters a caption font must contain to be usable as a text font: ASCII plus
+/// the diacritics of the UI languages (Polish, German, French, Spanish,
+/// Portuguese). A font lacking some of them (symbol fonts, decorative fonts)
+/// would make egui fall back glyph by glyph and mix several typefaces in one word.
+pub const REQUIRED_TEXT: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?'\"-()\
+    \u{105}\u{107}\u{119}\u{142}\u{144}\u{f3}\u{15b}\u{17a}\u{17c}\u{104}\u{106}\u{118}\u{141}\u{143}\u{d3}\u{15a}\u{179}\u{17b}\
+    \u{e4}\u{f6}\u{fc}\u{df}\u{c4}\u{d6}\u{dc}\u{e9}\u{e8}\u{ea}\u{eb}\u{e0}\u{e2}\u{e7}\u{ee}\u{ef}\u{f4}\u{f9}\u{fb}\u{ff}\
+    \u{f1}\u{e1}\u{ed}\u{fa}\u{e3}\u{f5}\u{c9}\u{c8}\u{c0}\u{c2}\u{c7}\u{d1}";
+
+/// Text fonts tried, in order, when the chosen font is not a usable text font.
+const FALLBACK_TEXT_FONTS: [&str; 12] = [
+    "Segoe UI",
+    "Inter",
+    "SF Pro Text",
+    "Helvetica Neue",
+    "Arial",
+    "Noto Sans",
+    "DejaVu Sans",
+    "Liberation Sans",
+    "Ubuntu",
+    "Roboto",
+    "Cantarell",
+    "Verdana",
+];
+
+/// Does the font face contain a glyph for every character of `text`?
+pub fn face_covers(data: &[u8], index: u32, text: &str) -> bool {
+    use skrifa::{FontRef, MetadataProvider};
+    let Ok(font) = FontRef::from_index(data, index) else {
+        return false;
+    };
+    let charmap = font.charmap();
+    text.chars().all(|c| charmap.map(c).is_some())
+}
+
+/// What [`apply_caption_font`] ended up using.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FontOutcome {
+    /// The font is not installed (or the list is still loading): built-in font.
+    Default,
+    /// The chosen font is used.
+    Chosen,
+    /// The chosen font lacks letters; `using` is used for the whole caption instead.
+    Substituted { requested: String, using: String },
 }
 
 impl FontCatalog {
@@ -109,6 +157,17 @@ impl FontCatalog {
         loaded.db.with_face_data(id, |data, index| FoundFace {
             data: data.to_vec(),
             index,
+            complete: face_covers(data, index, REQUIRED_TEXT),
+        })
+    }
+
+    /// The first installed font from [`FALLBACK_TEXT_FONTS`] that has every
+    /// required letter, as `(family name, face)`.
+    fn find_fallback_face(&self, weight: u32) -> Option<(&'static str, FoundFace)> {
+        FALLBACK_TEXT_FONTS.iter().find_map(|name| {
+            self.find_face(name, weight)
+                .filter(|f| f.complete)
+                .map(|f| (*name, f))
         })
     }
 }
@@ -140,13 +199,35 @@ pub fn apply_caption_font(
     catalog: &FontCatalog,
     css_family: &str,
     weight: u32,
-) -> bool {
+) -> FontOutcome {
     let family = primary_font_family(css_family);
     let mut defs = FontDefinitions::default();
     let mut chain: Vec<String> = Vec::new();
-    let mut found = false;
+    let mut outcome = FontOutcome::Default;
 
-    if let Some(face) = catalog.find_face(&family, weight) {
+    let face = match catalog.find_face(&family, weight) {
+        Some(face) if face.complete => Some(face),
+        // Not a usable text font: use one consistent installed text font instead.
+        Some(_) => match catalog.find_fallback_face(weight) {
+            Some((name, face)) => {
+                outcome = FontOutcome::Substituted {
+                    requested: family.clone(),
+                    using: name.to_string(),
+                };
+                Some(face)
+            }
+            None => {
+                outcome = FontOutcome::Substituted {
+                    requested: family.clone(),
+                    using: "Ubuntu".to_string(),
+                };
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(face) = face {
         let mut data = FontData::from_owned(face.data);
         data.index = face.index;
         let wght = data
@@ -162,7 +243,9 @@ pub fn apply_caption_font(
         defs.font_data
             .insert("unicaptions-caption-face".into(), Arc::new(data));
         chain.push("unicaptions-caption-face".into());
-        found = true;
+        if outcome == FontOutcome::Default {
+            outcome = FontOutcome::Chosen;
+        }
     }
 
     chain.extend(
@@ -173,7 +256,7 @@ pub fn apply_caption_font(
     );
     defs.families.insert(caption_family(), chain);
     ctx.set_fonts(defs);
-    found
+    outcome
 }
 
 #[cfg(test)]
@@ -201,8 +284,8 @@ mod tests {
     #[test]
     fn caption_font_installs_without_a_catalog() {
         let ctx = egui::Context::default();
-        let found = apply_caption_font(&ctx, &FontCatalog::empty(), "Inter, system-ui", 600);
-        assert!(!found);
+        let outcome = apply_caption_font(&ctx, &FontCatalog::empty(), "Inter, system-ui", 600);
+        assert_eq!(outcome, FontOutcome::Default);
     }
 
     #[test]
@@ -231,7 +314,69 @@ mod tests {
         };
         assert!(catalog.contains(&first));
         let ctx = egui::Context::default();
-        let found = apply_caption_font(&ctx, &catalog, &first, 400);
-        assert!(found, "expected to load face for {first}");
+        let outcome = apply_caption_font(&ctx, &catalog, &first, 400);
+        assert_ne!(
+            outcome,
+            FontOutcome::Default,
+            "expected to load a face for {first}"
+        );
+    }
+
+    fn ready_catalog() -> FontCatalog {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let catalog = FontCatalog::spawn(move || {
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        catalog
+    }
+
+    #[test]
+    fn required_text_covers_the_polish_letters() {
+        for c in "\u{105}\u{119}\u{144}\u{142}\u{f3}\u{15b}\u{107}\u{17a}\u{17c}".chars() {
+            assert!(REQUIRED_TEXT.contains(c), "missing {c:?}");
+        }
+    }
+
+    #[test]
+    fn a_real_text_font_is_complete_and_a_symbol_font_is_not() {
+        let catalog = ready_catalog();
+        // Any common text font installed on the machine must pass...
+        let text_font = FALLBACK_TEXT_FONTS
+            .iter()
+            .find_map(|n| catalog.find_face(n, 400).map(|f| (*n, f)));
+        if let Some((name, face)) = text_font {
+            assert!(face.complete, "{name} should cover the required letters");
+        }
+        // ...and the Windows symbol font must not (it only has part of Latin).
+        if let Some(face) = catalog.find_face("Segoe UI Symbol", 400) {
+            assert!(
+                !face.complete,
+                "Segoe UI Symbol must be rejected as a text font"
+            );
+        }
+    }
+
+    #[test]
+    fn an_incomplete_font_is_substituted_by_one_consistent_text_font() {
+        let catalog = ready_catalog();
+        if catalog.find_face("Segoe UI Symbol", 600).is_none() {
+            return; // not a Windows machine
+        }
+        let ctx = egui::Context::default();
+        match apply_caption_font(&ctx, &catalog, "'Segoe UI Symbol'", 600) {
+            FontOutcome::Substituted { requested, using } => {
+                assert_eq!(requested, "Segoe UI Symbol");
+                assert!(!using.is_empty());
+            }
+            other => panic!("expected a substitution, got {other:?}"),
+        }
+        // a complete font is used as chosen
+        if catalog.find_face("Segoe UI", 600).is_some() {
+            assert_eq!(
+                apply_caption_font(&ctx, &catalog, "Segoe UI", 600),
+                FontOutcome::Chosen
+            );
+        }
     }
 }

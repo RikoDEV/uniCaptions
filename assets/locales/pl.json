@@ -130,7 +130,8 @@
   },
   "fontPicker": {
     "custom": "Niestandardowa ({{value}})",
-    "search": "Szukaj zainstalowanych czcionek"
+    "search": "Szukaj zainstalowanych czcionek",
+    "substituted": "Czcionka „{{font}}” nie zawiera wszystkich liter, więc napisy używają czcionki „{{fallback}}”."
   },
   "errors": {
     "captioningFailed": "Nie udało się uruchomić napisów: {{error}}",

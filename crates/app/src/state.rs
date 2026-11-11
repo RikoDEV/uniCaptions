@@ -66,6 +66,8 @@ pub struct UiState {
     pub key_present: HashMap<ApiProvider, bool>,
     pub key_input: HashMap<ApiProvider, String>,
     pub font_search: String,
+    /// `(requested, used)` when the chosen caption font lacks letters and another is used.
+    pub font_notice: Option<(String, String)>,
     pub autostart: Option<bool>,
     /// Starts captioning once, on first frame, if `autoStartCaptioning` is set.
     pub auto_start_done: bool,
@@ -85,6 +87,7 @@ impl Default for UiState {
             key_present: HashMap::new(),
             key_input: HashMap::new(),
             font_search: String::new(),
+            font_notice: None,
             autostart: None,
             auto_start_done: false,
         }

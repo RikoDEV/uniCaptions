@@ -27,6 +27,8 @@ eframe = { version = "0.37", default-features = false, features = [
 egui_extras = { version = "0.37", features = ["svg", "image"] }
 tray-icon = "0.26"
 fontdb = "0.24"
+# Glyph-coverage checks for the caption font (same version fontdb already uses).
+skrifa = "0.44"
 auto-launch = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 single-instance = "0.3"

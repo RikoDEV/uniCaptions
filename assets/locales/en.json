@@ -130,7 +130,8 @@
   },
   "fontPicker": {
     "custom": "Custom ({{value}})",
-    "search": "Search installed fonts"
+    "search": "Search installed fonts",
+    "substituted": "Font \"{{font}}\" is missing some letters, so \"{{fallback}}\" is used for captions instead."
   },
   "errors": {
     "captioningFailed": "Captioning failed: {{error}}",
