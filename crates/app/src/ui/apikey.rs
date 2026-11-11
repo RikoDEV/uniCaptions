@@ -40,7 +40,11 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx, provider: ApiProvider, label: &str) {
                 clear = true;
             }
         });
-        let hint = if has_key { "apiKey.savedHint" } else { "apiKey.notSavedHint" };
+        let hint = if has_key {
+            "apiKey.savedHint"
+        } else {
+            "apiKey.notSavedHint"
+        };
         widgets::hint(ui, &pal, &cx.t.t(hint));
 
         if save {

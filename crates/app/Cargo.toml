@@ -44,3 +44,26 @@ tempfile = "3"
 [package.metadata.winresource]
 ProductName = "uniCaptions"
 FileDescription = "Live captions and translation overlay"
+
+# Installer/bundle configuration for `cargo packager` (https://crates.io/crates/cargo-packager).
+# Run from this directory: `cargo packager --release`. Keys are camelCase.
+[package.metadata.packager]
+productName = "uniCaptions"
+identifier = "com.unicaptions.app"
+outDir = "../../dist"
+category = "Utility"
+icons = [
+    "../../assets/32x32.png",
+    "../../assets/128x128.png",
+    "../../assets/128x128@2x.png",
+    "../../assets/icon.icns",
+    "../../assets/icon.ico",
+]
+beforePackagingCommand = "cargo build --release -p unicaptions"
+
+[package.metadata.packager.macos]
+minimumSystemVersion = "11.0"
+infoPlistPath = "Info.plist"
+
+[package.metadata.packager.nsis]
+installMode = "currentUser"

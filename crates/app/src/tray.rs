@@ -35,7 +35,8 @@ fn build(
     let menu = Menu::new();
     let show = MenuItem::new(&labels.show, true, None);
     let quit = MenuItem::new(&labels.quit, true, None);
-    menu.append_items(&[&show, &quit]).map_err(|e| e.to_string())?;
+    menu.append_items(&[&show, &quit])
+        .map_err(|e| e.to_string())?;
     let (show_id, quit_id) = (show.id().clone(), quit.id().clone());
 
     let tray = TrayIconBuilder::new()
@@ -113,13 +114,16 @@ impl Tray {
                 match build(&initial, on_show, on_quit) {
                     Ok((tray, show, quit)) => {
                         let _ = ready_tx.send(Ok(()));
-                        gtk::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
-                            while let Ok(l) = labels_rx.try_recv() {
-                                show.set_text(&l.show);
-                                quit.set_text(&l.quit);
-                            }
-                            gtk::glib::ControlFlow::Continue
-                        });
+                        gtk::glib::timeout_add_local(
+                            std::time::Duration::from_millis(250),
+                            move || {
+                                while let Ok(l) = labels_rx.try_recv() {
+                                    show.set_text(&l.show);
+                                    quit.set_text(&l.quit);
+                                }
+                                gtk::glib::ControlFlow::Continue
+                            },
+                        );
                         gtk::main();
                         drop(tray);
                     }

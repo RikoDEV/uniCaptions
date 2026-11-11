@@ -23,7 +23,11 @@ pub async fn translate(api_key: &str, text: &str, target_lang: &str) -> Result<S
     let client = reqwest::Client::new();
     let response = client
         .post(format!("{base}/v2/translate"))
-        .form(&[("auth_key", api_key), ("text", text), ("target_lang", &target)])
+        .form(&[
+            ("auth_key", api_key),
+            ("text", text),
+            ("target_lang", &target),
+        ])
         .send()
         .await
         .map_err(|e| e.to_string())?;

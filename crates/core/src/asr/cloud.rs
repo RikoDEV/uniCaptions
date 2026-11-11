@@ -7,12 +7,18 @@ struct TranscriptionResponse {
 }
 
 /// Transcribes a WAV audio chunk using OpenAI's Whisper API.
-pub async fn transcribe(api_key: &str, wav_bytes: Vec<u8>, language: &str) -> Result<String, String> {
+pub async fn transcribe(
+    api_key: &str,
+    wav_bytes: Vec<u8>,
+    language: &str,
+) -> Result<String, String> {
     let part = multipart::Part::bytes(wav_bytes)
         .file_name("audio.wav")
         .mime_str("audio/wav")
         .map_err(|e| e.to_string())?;
-    let mut form = multipart::Form::new().part("file", part).text("model", "whisper-1");
+    let mut form = multipart::Form::new()
+        .part("file", part)
+        .text("model", "whisper-1");
     if language != "auto" {
         form = form.text("language", language.to_string());
     }

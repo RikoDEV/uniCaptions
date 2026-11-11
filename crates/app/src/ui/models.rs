@@ -54,13 +54,17 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) {
                                     } else {
                                         cx.t.t("models.notDownloaded")
                                     };
-                                    ui.label(RichText::new(status).size(12.5).color(pal.text_faint));
+                                    ui.label(
+                                        RichText::new(status).size(12.5).color(pal.text_faint),
+                                    );
                                 }
                             }
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if m.downloaded {
-                                if widgets::plain_button(ui, &cx.t.t("models.delete"), true).clicked() {
+                                if widgets::plain_button(ui, &cx.t.t("models.delete"), true)
+                                    .clicked()
+                                {
                                     delete = Some(format!("{}:{}", m.kind.as_str(), m.id));
                                 }
                             } else {

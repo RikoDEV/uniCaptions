@@ -10,7 +10,11 @@ use eframe::egui::{
 
 /// A pill-shaped on/off switch. Returns the response; `changed()` is set on toggle.
 pub fn toggle(ui: &mut Ui, pal: &Palette, on: &mut bool, enabled: bool) -> Response {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, mut resp) = ui.allocate_exact_size(vec2(38.0, 22.0), sense);
     if enabled && resp.clicked() {
         *on = !*on;
@@ -187,7 +191,13 @@ pub fn card_select<T: Copy + PartialEq>(
                 Stroke::new(1.0, pal.border)
             };
             let painter = ui.painter();
-            painter.rect(rect, CornerRadius::same(10), fill, stroke, StrokeKind::Inside);
+            painter.rect(
+                rect,
+                CornerRadius::same(10),
+                fill,
+                stroke,
+                StrokeKind::Inside,
+            );
 
             let tint = if active { pal.accent } else { pal.text_muted };
             let icon_center = pos2(rect.center().x, rect.top() + 23.0);
@@ -270,7 +280,8 @@ pub fn nav_item(ui: &mut Ui, pal: &Palette, icon: Icon, label: &str, active: boo
     };
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(6), fill);
-    let icon_rect = Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(18.0, 18.0));
+    let icon_rect =
+        Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(18.0, 18.0));
     Image::new(icon.source()).tint(fg).paint_at(ui, icon_rect);
     ui.painter().text(
         pos2(rect.left() + 38.0, rect.center().y),

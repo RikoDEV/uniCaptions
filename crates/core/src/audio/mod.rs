@@ -85,9 +85,7 @@ where
     let device = host
         .default_input_device()
         .ok_or_else(|| "no input device found".to_string())?;
-    let config = device
-        .default_input_config()
-        .map_err(|e| e.to_string())?;
+    let config = device.default_input_config().map_err(|e| e.to_string())?;
     let channels = config.channels() as usize;
     let sample_rate = config.sample_rate().0;
     let sample_format = config.sample_format();

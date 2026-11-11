@@ -33,15 +33,31 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) {
                 (Provider::Local, cx.t.t("translation.providerLocal")),
                 (Provider::Cloud, cx.t.t("translation.providerCloud")),
             ];
-            combo(ui, "translate-provider", &mut cx.settings.translate_provider, &options, enabled);
+            combo(
+                ui,
+                "translate-provider",
+                &mut cx.settings.translate_provider,
+                &options,
+                enabled,
+            );
         });
 
         row(ui, &cx.t.t("translation.showOriginal"), |ui| {
-            widgets::toggle(ui, &pal, &mut cx.settings.caption_style.show_original, enabled);
+            widgets::toggle(
+                ui,
+                &pal,
+                &mut cx.settings.caption_style.show_original,
+                enabled,
+            );
         });
 
         if enabled && cx.settings.translate_provider == Provider::Cloud {
-            apikey::draw(ui, cx, ApiProvider::DeepL, &cx.t.t("translation.deeplKeyLabel"));
+            apikey::draw(
+                ui,
+                cx,
+                ApiProvider::DeepL,
+                &cx.t.t("translation.deeplKeyLabel"),
+            );
         }
 
         if enabled

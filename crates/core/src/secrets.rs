@@ -55,6 +55,22 @@ impl ApiProvider {
 mod tests {
     use super::*;
 
+    /// Guards against the in-memory mock store (keyring 3.x without a platform
+    /// feature): a *new* `Entry` must see what an earlier one saved. Windows
+    /// only: CI macOS keychains are locked and Linux runners have no secret service.
+    #[cfg(windows)]
+    #[test]
+    fn keys_persist_in_the_real_os_credential_store() {
+        let name = format!("unicaptions-test-{}", std::process::id());
+        assert_eq!(get(&name).unwrap(), None);
+        save(&name, "s3cret-value").unwrap();
+        assert!(has(&name).unwrap());
+        assert_eq!(get(&name).unwrap().as_deref(), Some("s3cret-value"));
+        delete(&name).unwrap();
+        assert_eq!(get(&name).unwrap(), None);
+        delete(&name).unwrap(); // deleting a missing key is fine
+    }
+
     #[test]
     fn secret_keys_match_legacy_names() {
         assert_eq!(ApiProvider::OpenAiAsr.secret_key(), "openai_asr");

@@ -106,7 +106,11 @@ fn captioning_toggle_row(ui: &mut Ui, cx: &mut Cx) {
     ui.horizontal(|ui| {
         widgets::status_dot(
             ui,
-            if status == CaptioningStatus::Live { pal.live } else { pal.text_faint },
+            if status == CaptioningStatus::Live {
+                pal.live
+            } else {
+                pal.text_faint
+            },
             status == CaptioningStatus::Live,
         );
         ui.label(RichText::new(label).size(12.5).color(pal.text_muted));
@@ -141,37 +145,43 @@ fn content(ui: &mut Ui, cx: &mut Cx) {
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(pal.bg))
         .show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                // A centred column, at most 640px wide.
-                let avail = ui.available_width();
-                let w = (avail - 64.0).clamp(280.0, 640.0);
-                let offset = ((avail - w) / 2.0).max(0.0);
-                ui.add_space(28.0);
-                ui.horizontal_top(|ui| {
-                    ui.add_space(offset);
-                    ui.vertical(|ui| {
-                        ui.set_width(w);
-                        ui.spacing_mut().item_spacing.y = 16.0;
-                        header(ui, cx);
-                        error_banner(ui, cx);
-                        match cx.st.tab {
-                            Tab::General => general::draw(ui, cx),
-                            Tab::CaptionStyle => style::draw(ui, cx),
-                            Tab::Translation => translation::draw(ui, cx),
-                            Tab::Models => models::draw(ui, cx),
-                            Tab::About => about::draw(ui, cx),
-                        }
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    // A centred column, at most 640px wide.
+                    let avail = ui.available_width();
+                    let w = (avail - 64.0).clamp(280.0, 640.0);
+                    let offset = ((avail - w) / 2.0).max(0.0);
+                    ui.add_space(28.0);
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(offset);
+                        ui.vertical(|ui| {
+                            ui.set_width(w);
+                            ui.spacing_mut().item_spacing.y = 16.0;
+                            header(ui, cx);
+                            error_banner(ui, cx);
+                            match cx.st.tab {
+                                Tab::General => general::draw(ui, cx),
+                                Tab::CaptionStyle => style::draw(ui, cx),
+                                Tab::Translation => translation::draw(ui, cx),
+                                Tab::Models => models::draw(ui, cx),
+                                Tab::About => about::draw(ui, cx),
+                            }
+                        });
                     });
+                    ui.add_space(40.0);
                 });
-                ui.add_space(40.0);
-            });
         });
 }
 
 fn header(ui: &mut Ui, cx: &Cx) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
-        ui.label(RichText::new(cx.t.t(cx.st.tab.label_key())).size(22.0).strong());
+        ui.label(
+            RichText::new(cx.t.t(cx.st.tab.label_key()))
+                .size(22.0)
+                .strong(),
+        );
         ui.label(
             RichText::new(cx.t.t(cx.st.tab.description_key()))
                 .size(13.5)
@@ -227,7 +237,9 @@ pub fn combo<T: PartialEq + Copy>(
             .width(ui.available_width().min(420.0))
             .show_ui(ui, |ui| {
                 for (value, label) in options {
-                    if ui.selectable_label(*current == *value, label).clicked() && *current != *value {
+                    if ui.selectable_label(*current == *value, label).clicked()
+                        && *current != *value
+                    {
                         *current = *value;
                         changed = true;
                     }
@@ -324,11 +336,15 @@ mod tests {
         let h = harness();
         for lang in UI_LANGUAGES {
             let t = I18n::new(lang);
-            let mut settings = Settings::default();
-            settings.translation_enabled = true;
-            let mut st = UiState::default();
-            st.models = h.engine.list_models().unwrap();
-            st.models_dirty = false;
+            let mut settings = Settings {
+                translation_enabled: true,
+                ..Settings::default()
+            };
+            let mut st = UiState {
+                models: h.engine.list_models().unwrap(),
+                models_dirty: false,
+                ..UiState::default()
+            };
             for tab in Tab::ALL {
                 st.tab = tab;
                 // two frames: egui lays out widgets across passes

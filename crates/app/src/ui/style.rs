@@ -32,19 +32,29 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) {
 
         let size_label = cx.t.tr(
             "captionStyle.fontSize",
-            &[("size", &format!("{}", cx.settings.caption_style.font_size.round() as i32))],
+            &[(
+                "size",
+                &format!("{}", cx.settings.caption_style.font_size.round() as i32),
+            )],
         );
         field(ui, &size_label, |ui| {
             full_slider(
                 ui,
-                egui::Slider::new(&mut cx.settings.caption_style.font_size, 14.0..=64.0).step_by(1.0),
+                egui::Slider::new(&mut cx.settings.caption_style.font_size, 14.0..=64.0)
+                    .step_by(1.0),
             );
         });
 
         field(ui, &cx.t.t("captionStyle.fontWeight"), |ui| {
             let options: Vec<(u32, String)> =
                 WEIGHTS.iter().map(|(w, key)| (*w, cx.t.t(key))).collect();
-            combo(ui, "caption-weight", &mut cx.settings.caption_style.font_weight, &options, true);
+            combo(
+                ui,
+                "caption-weight",
+                &mut cx.settings.caption_style.font_weight,
+                &options,
+                true,
+            );
         });
 
         color_row(
@@ -63,7 +73,10 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) {
         let pct = (cx.settings.caption_style.background_opacity * 100.0).round() as i32;
         field(
             ui,
-            &cx.t.tr("captionStyle.backgroundOpacity", &[("opacity", &pct.to_string())]),
+            &cx.t.tr(
+                "captionStyle.backgroundOpacity",
+                &[("opacity", &pct.to_string())],
+            ),
             |ui| {
                 full_slider(
                     ui,
@@ -76,7 +89,8 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) {
         let lines = cx.settings.caption_style.max_lines;
         field(
             ui,
-            &cx.t.tr("captionStyle.maxLines", &[("lines", &lines.to_string())]),
+            &cx.t
+                .tr("captionStyle.maxLines", &[("lines", &lines.to_string())]),
             |ui| {
                 full_slider(
                     ui,

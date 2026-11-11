@@ -42,7 +42,10 @@ pub enum AsrConfig {
 
 pub enum TranslateConfig {
     Local(Box<Translator>),
-    Cloud { api_key: String, target_lang: String },
+    Cloud {
+        api_key: String,
+        target_lang: String,
+    },
     None,
 }
 
@@ -153,7 +156,10 @@ fn spawn_translate_worker(
                         None
                     }
                 },
-                TranslateConfig::Cloud { api_key, target_lang } => {
+                TranslateConfig::Cloud {
+                    api_key,
+                    target_lang,
+                } => {
                     match rt.block_on(crate::translate::cloud::translate(
                         api_key,
                         &job.text,
@@ -255,7 +261,9 @@ pub async fn ensure_model_downloaded(
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let response = reqwest::get(model_url(&size)).await.map_err(|e| e.to_string())?;
+    let response = reqwest::get(model_url(&size))
+        .await
+        .map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Err(format!("model download failed: HTTP {}", response.status()));
     }
@@ -319,19 +327,24 @@ pub fn start_captioning(
     let level: Arc<Mutex<f32>> = Arc::new(Mutex::new(0.0));
     let level_capture = level.clone();
 
-    let capture = audio::start_capture_stream(&audio_source, move |data, sample_rate, channels| {
-        let mono = audio::downmix(data, channels);
-        if let Ok(mut l) = level_capture.lock() {
-            *l = audio::rms(&mono);
-        }
-        let resampled = audio::resample_linear(&mono, sample_rate, TARGET_SAMPLE_RATE);
-        if let Ok(mut buf) = buffer_capture.lock() {
-            buf.extend_from_slice(&resampled);
-        }
-    })?;
+    let capture =
+        audio::start_capture_stream(&audio_source, move |data, sample_rate, channels| {
+            let mono = audio::downmix(data, channels);
+            if let Ok(mut l) = level_capture.lock() {
+                *l = audio::rms(&mono);
+            }
+            let resampled = audio::resample_linear(&mono, sample_rate, TARGET_SAMPLE_RATE);
+            if let Ok(mut buf) = buffer_capture.lock() {
+                buf.extend_from_slice(&resampled);
+            }
+        })?;
 
-    let (translate_slot, translate_worker) =
-        spawn_translate_worker(sink.clone(), rt.clone(), stop_flag.clone(), translate_config);
+    let (translate_slot, translate_worker) = spawn_translate_worker(
+        sink.clone(),
+        rt.clone(),
+        stop_flag.clone(),
+        translate_config,
+    );
 
     let stop_worker = stop_flag.clone();
     let worker = thread::Builder::new()
@@ -396,6 +409,22 @@ fn transcribe_local(
     Ok(text)
 }
 
+/// One-shot transcription of 16 kHz mono samples with a local Whisper model.
+/// Handy for tests and tooling; live captioning uses a streaming loop instead.
+pub fn transcribe_samples(
+    model_path: &std::path::Path,
+    samples_16k: &[f32],
+    language: &str,
+) -> Result<String, String> {
+    let ctx = WhisperContext::new_with_params(
+        model_path.to_str().ok_or("invalid model path")?,
+        WhisperContextParameters::default(),
+    )
+    .map_err(|e| format!("failed to load whisper model: {e}"))?;
+    let mut state = ctx.create_state().map_err(|e| e.to_string())?;
+    transcribe_local(&mut state, samples_16k, language)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_asr_loop(
     whisper_ctx: Option<WhisperContext>,
@@ -411,13 +440,15 @@ fn run_asr_loop(
     let window_size = TARGET_SAMPLE_RATE as usize * WINDOW_SECONDS;
     let step_size = (TARGET_SAMPLE_RATE as f32 * STEP_SECONDS) as usize;
     let overlap_size = window_size - step_size;
-    let mut whisper_state = whisper_ctx.as_ref().and_then(|ctx| match ctx.create_state() {
-        Ok(s) => Some(s),
-        Err(e) => {
-            eprintln!("failed to create whisper state: {e}");
-            None
-        }
-    });
+    let mut whisper_state = whisper_ctx
+        .as_ref()
+        .and_then(|ctx| match ctx.create_state() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("failed to create whisper state: {e}");
+                None
+            }
+        });
     let mut last_caption_was_empty = true;
 
     while !stop_flag.load(Ordering::SeqCst) {

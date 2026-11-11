@@ -6,49 +6,65 @@ on:
       - "v*"
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PACKAGER_VERSION: "0.11.8"
+  # whisper.cpp/ggml uses std::filesystem, which requires macOS 10.15+.
+  # macos-latest runners are Apple Silicon (macOS 11+ only), so raising this is
+  # safe. Ignored on other platforms.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
 jobs:
-  release:
+  package:
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
-        platform: [windows-latest, macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.platform }}
+        include:
+          - os: windows-latest
+            formats: nsis
+            files: "dist/*.exe"
+          - os: macos-latest
+            formats: dmg
+            files: "dist/*.dmg"
+          - os: ubuntu-latest
+            formats: deb,appimage
+            files: "dist/*.deb dist/*.AppImage"
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Install Linux system dependencies
-        if: matrix.platform == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libclang-dev cmake libasound2-dev libdbus-1-dev libssl-dev \
-            libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+            pkg-config libclang-dev cmake libasound2-dev libdbus-1-dev \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
 
       - name: Install macOS system dependencies
-        if: matrix.platform == 'macos-latest'
+        if: matrix.os == 'macos-latest'
         run: brew install cmake
 
       - name: Install Windows system dependencies (LLVM)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.os == 'windows-latest'
         run: choco install llvm -y
 
       - name: Set LIBCLANG_PATH (Windows)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
       - name: Shorten CARGO_TARGET_DIR (Windows)
-        # See the matching step in ci.yml: whisper.cpp's Vulkan shader-gen
-        # sub-build hits Windows' 260-char MAX_PATH with this repo's default
-        # checkout path otherwise (FileTracker FTK1011).
-        if: matrix.platform == 'windows-latest'
+        # See ci.yml: whisper.cpp's Vulkan shader-gen sub-build hits Windows'
+        # 260-char MAX_PATH with the default checkout path otherwise.
+        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: echo "CARGO_TARGET_DIR=C:\ct" >> $env:GITHUB_ENV
 
       - name: Resolve latest Vulkan SDK version (Windows)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           $ver = (Invoke-RestMethod -Uri "https://vulkan.lunarg.com/sdk/latest/windows.txt").Trim()
@@ -57,7 +73,7 @@ jobs:
           echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
 
       - name: Cache Vulkan SDK (Windows)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.os == 'windows-latest'
         id: vulkan-sdk-cache
         uses: actions/cache@v4
         with:
@@ -65,9 +81,7 @@ jobs:
           key: windows-vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}
 
       - name: Install Vulkan SDK (Windows, for whisper-rs GPU acceleration)
-        # See the matching step in ci.yml for why this uses the official
-        # LunarG installer instead of humbletim/setup-vulkan-sdk.
-        if: matrix.platform == 'windows-latest' && steps.vulkan-sdk-cache.outputs.cache-hit != 'true'
+        if: matrix.os == 'windows-latest' && steps.vulkan-sdk-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe" -OutFile "$env:RUNNER_TEMP\vulkan_sdk.exe"
@@ -76,34 +90,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo-packager
+        id: packager-cache
+        uses: actions/cache@v4
         with:
-          workspaces: src-tauri
+          path: |
+            ~/.cargo/bin/cargo-packager
+            ~/.cargo/bin/cargo-packager.exe
+          key: cargo-packager-${{ env.CARGO_PACKAGER_VERSION }}-${{ runner.os }}
 
-      - uses: pnpm/action-setup@v6
+      - name: Install cargo-packager
+        if: steps.packager-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --locked --version ${{ env.CARGO_PACKAGER_VERSION }}
+
+      - name: Build installers
+        working-directory: crates/app
+        run: cargo packager --release --formats ${{ matrix.formats }}
+
+      - uses: actions/upload-artifact@v4
         with:
-          version: 10
+          name: uniCaptions-${{ runner.os }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
 
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - run: pnpm install --frozen-lockfile
-
-      - uses: tauri-apps/tauri-action@v1
+      - name: Attach to the GitHub release
+        # Attaches build artifacts to the release for this tag (creating it only
+        # if it doesn't exist yet, so a release you wrote by hand keeps its
+        # title and notes).
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # whisper.cpp/ggml uses std::filesystem, which requires macOS 10.15+.
-          # Tauri's default deployment target (10.13) is too low and fails the
-          # build; macos-latest runners are Apple Silicon (macOS 11+ only) so
-          # raising this is safe. Ignored on non-macOS platforms.
-          MACOSX_DEPLOYMENT_TARGET: "11.0"
-        with:
-          # Attaches build artifacts to a release you already created for this
-          # tag, instead of creating a separate one. releaseName/releaseBody
-          # are intentionally omitted so the action doesn't overwrite the
-          # title/notes you wrote by hand. releaseDraft must match the actual
-          # state of that release (false = already published).
-          tagName: ${{ github.ref_name }}
-          releaseDraft: false
-          prerelease: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 \
+            || gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --generate-notes \
+            || true
+          gh release upload "${{ github.ref_name }}" ${{ matrix.files }} --clobber

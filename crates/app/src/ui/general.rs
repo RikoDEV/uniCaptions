@@ -40,8 +40,10 @@ fn audio_panel(ui: &mut Ui, cx: &mut Cx) {
 
         field(ui, &cx.t.t("general.audioSource"), |ui| {
             let options = [
-                CardOption::new(AudioSource::Microphone, cx.t.t("general.microphone")).icon(Icon::Mic),
-                CardOption::new(AudioSource::System, cx.t.t("general.systemAudio")).icon(Icon::Speaker),
+                CardOption::new(AudioSource::Microphone, cx.t.t("general.microphone"))
+                    .icon(Icon::Mic),
+                CardOption::new(AudioSource::System, cx.t.t("general.systemAudio"))
+                    .icon(Icon::Speaker),
             ];
             if let Some(v) = card_select(ui, &pal, cx.settings.audio_source, &options, false) {
                 cx.settings.audio_source = v;
@@ -54,7 +56,8 @@ fn audio_panel(ui: &mut Ui, cx: &mut Cx) {
         };
         field(
             ui,
-            &cx.t.tr("general.audioTestLabel", &[("source", &source_name)]),
+            &cx.t
+                .tr("general.audioTestLabel", &[("source", &source_name)]),
             |ui| {
                 ui.horizontal(|ui| {
                     let label = if cx.st.mic_active {
@@ -128,7 +131,8 @@ fn speech_panel(ui: &mut Ui, cx: &mut Cx) {
 
         field(ui, &cx.t.t("general.provider"), |ui| {
             let options = [
-                CardOption::new(Provider::Local, cx.t.t("general.providerLocal")).icon(Icon::Offline),
+                CardOption::new(Provider::Local, cx.t.t("general.providerLocal"))
+                    .icon(Icon::Offline),
                 CardOption::new(Provider::Cloud, cx.t.t("general.providerCloud")).icon(Icon::Cloud),
             ];
             if let Some(v) = card_select(ui, &pal, cx.settings.asr_provider, &options, false) {
@@ -155,7 +159,12 @@ fn speech_panel(ui: &mut Ui, cx: &mut Cx) {
                 }
             });
         } else {
-            apikey::draw(ui, cx, ApiProvider::OpenAiAsr, &cx.t.t("general.openaiKeyLabel"));
+            apikey::draw(
+                ui,
+                cx,
+                ApiProvider::OpenAiAsr,
+                &cx.t.t("general.openaiKeyLabel"),
+            );
         }
 
         widgets::hint(ui, &pal, &cx.t.t("general.speechHint"));
@@ -164,14 +173,18 @@ fn speech_panel(ui: &mut Ui, cx: &mut Cx) {
 
 /// Choosing a model that isn't on disk starts downloading it right away.
 fn select_asr_model(cx: &mut Cx, size: WhisperSize) {
-    let downloading = cx.st.download_progress(ModelKind::Whisper, size.as_str()).is_some();
+    let downloading = cx
+        .st
+        .download_progress(ModelKind::Whisper, size.as_str())
+        .is_some();
     if is_whisper_downloaded(cx, size) || downloading {
         return;
     }
     cx.st
         .progress
         .insert((ModelKind::Whisper, size.as_str().to_string()), 0.0);
-    cx.engine.download_model(ModelKind::Whisper, size.as_str().to_string());
+    cx.engine
+        .download_model(ModelKind::Whisper, size.as_str().to_string());
 }
 
 fn behavior_panel(ui: &mut Ui, cx: &mut Cx) {
@@ -186,10 +199,7 @@ fn behavior_panel(ui: &mut Ui, cx: &mut Cx) {
             widgets::hint(ui, &pal, &cx.t.t("general.clickThroughHint"));
         });
 
-        let mut autostart = cx
-            .st
-            .autostart
-            .unwrap_or_else(|| cx.autostart.is_enabled());
+        let mut autostart = cx.st.autostart.unwrap_or_else(|| cx.autostart.is_enabled());
         cx.st.autostart = Some(autostart);
         row(ui, &cx.t.t("general.launchAtStartup"), |ui| {
             if widgets::toggle(ui, &pal, &mut autostart, true).changed() {

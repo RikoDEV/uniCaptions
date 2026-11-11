@@ -30,12 +30,16 @@ pub fn list_models(paths: &Paths) -> Result<Vec<ModelEntry>, String> {
             bytes_on_disk: m.bytes_on_disk,
         })
         .collect();
-    entries.extend(translate::list_translate_models(paths)?.into_iter().map(|m| ModelEntry {
-        kind: ModelKind::Translate,
-        id: m.lang,
-        downloaded: m.downloaded,
-        bytes_on_disk: m.bytes_on_disk,
-    }));
+    entries.extend(
+        translate::list_translate_models(paths)?
+            .into_iter()
+            .map(|m| ModelEntry {
+                kind: ModelKind::Translate,
+                id: m.lang,
+                downloaded: m.downloaded,
+                bytes_on_disk: m.bytes_on_disk,
+            }),
+    );
     Ok(entries)
 }
 
@@ -64,8 +68,14 @@ mod tests {
 
     #[test]
     fn parses_model_keys() {
-        assert_eq!(parse_model_key("whisper:base").unwrap(), (ModelKind::Whisper, "base"));
-        assert_eq!(parse_model_key("translate:es").unwrap(), (ModelKind::Translate, "es"));
+        assert_eq!(
+            parse_model_key("whisper:base").unwrap(),
+            (ModelKind::Whisper, "base")
+        );
+        assert_eq!(
+            parse_model_key("translate:es").unwrap(),
+            (ModelKind::Translate, "es")
+        );
         assert!(parse_model_key("nokind").is_err());
         assert!(parse_model_key("gpt:4").is_err());
     }

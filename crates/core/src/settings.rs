@@ -229,7 +229,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Generic keywords (`system-ui`, `sans-serif`, ...) are returned as-is.
 pub fn primary_font_family(css: &str) -> String {
     let first = css.split(',').next().unwrap_or("").trim();
-    first.trim_matches(|c| c == '\'' || c == '"').trim().to_string()
+    first
+        .trim_matches(|c| c == '\'' || c == '"')
+        .trim()
+        .to_string()
 }
 
 /// Settings shared by every window, with debounced background persistence.
@@ -388,7 +391,10 @@ mod tests {
     #[test]
     fn missing_or_corrupt_file_gives_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(Settings::load(&dir.path().join("nope.json")), Settings::default());
+        assert_eq!(
+            Settings::load(&dir.path().join("nope.json")),
+            Settings::default()
+        );
         let bad = dir.path().join("bad.json");
         fs::write(&bad, "{not json").unwrap();
         assert_eq!(Settings::load(&bad), Settings::default());
@@ -430,7 +436,10 @@ mod tests {
     fn primary_font_family_parses_css_lists() {
         assert_eq!(primary_font_family("Inter, system-ui, sans-serif"), "Inter");
         assert_eq!(primary_font_family("'Segoe UI', sans-serif"), "Segoe UI");
-        assert_eq!(primary_font_family("\"Times New Roman\", serif"), "Times New Roman");
+        assert_eq!(
+            primary_font_family("\"Times New Roman\", serif"),
+            "Times New Roman"
+        );
         assert_eq!(primary_font_family("system-ui, sans-serif"), "system-ui");
         assert_eq!(primary_font_family(""), "");
     }

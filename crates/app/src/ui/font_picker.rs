@@ -45,14 +45,16 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) -> Option<String> {
                 }
                 Some(list) => {
                     let search = cx.st.font_search.clone();
-                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                        for family in list.iter().filter(|f| matches_search(f, &search)) {
-                            let selected = family.eq_ignore_ascii_case(&current);
-                            if ui.selectable_label(selected, family).clicked() {
-                                picked = Some(family.clone());
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for family in list.iter().filter(|f| matches_search(f, &search)) {
+                                let selected = family.eq_ignore_ascii_case(&current);
+                                if ui.selectable_label(selected, family).clicked() {
+                                    picked = Some(family.clone());
+                                }
                             }
-                        }
-                    });
+                        });
                 }
             }
         });

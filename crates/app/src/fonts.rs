@@ -106,12 +106,10 @@ impl FontCatalog {
             style: fontdb::Style::Normal,
         };
         let id = loaded.db.query(&query)?;
-        loaded
-            .db
-            .with_face_data(id, |data, index| FoundFace {
-                data: data.to_vec(),
-                index,
-            })
+        loaded.db.with_face_data(id, |data, index| FoundFace {
+            data: data.to_vec(),
+            index,
+        })
     }
 }
 

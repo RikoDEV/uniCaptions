@@ -129,11 +129,23 @@ pub fn install(ctx: &egui::Context) {
             style.spacing.interact_size.y = 30.0;
             style.spacing.slider_width = 260.0;
             style.text_styles = [
-                (TextStyle::Heading, FontId::new(22.0, FontFamily::Proportional)),
+                (
+                    TextStyle::Heading,
+                    FontId::new(22.0, FontFamily::Proportional),
+                ),
                 (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
-                (TextStyle::Button, FontId::new(14.0, FontFamily::Proportional)),
-                (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
-                (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+                (
+                    TextStyle::Button,
+                    FontId::new(14.0, FontFamily::Proportional),
+                ),
+                (
+                    TextStyle::Small,
+                    FontId::new(12.0, FontFamily::Proportional),
+                ),
+                (
+                    TextStyle::Monospace,
+                    FontId::new(13.0, FontFamily::Monospace),
+                ),
             ]
             .into();
         });

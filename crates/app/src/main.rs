@@ -9,9 +9,9 @@ mod i18n;
 mod icons;
 mod overlay;
 mod state;
-mod theme;
 #[cfg(test)]
 mod testutil;
+mod theme;
 mod tray;
 mod ui;
 mod widgets;
@@ -20,7 +20,9 @@ use eframe::egui;
 use unicaptions_core::{Paths, SettingsStore};
 
 fn window_icon() -> Option<egui::IconData> {
-    let img = image::load_from_memory(icons::WINDOW_ICON_PNG).ok()?.into_rgba8();
+    let img = image::load_from_memory(icons::WINDOW_ICON_PNG)
+        .ok()?
+        .into_rgba8();
     let (width, height) = img.dimensions();
     Some(egui::IconData {
         rgba: img.into_raw(),

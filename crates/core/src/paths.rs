@@ -82,8 +82,14 @@ mod tests {
     #[test]
     fn model_paths_match_legacy_layout() {
         let p = Paths::from_dirs("/d", "/c");
-        assert_eq!(p.whisper_model_file("base"), Path::new("/d/models/whisper/ggml-base.bin"));
-        assert_eq!(p.translate_model_dir("es"), Path::new("/d/models/translate/es"));
+        assert_eq!(
+            p.whisper_model_file("base"),
+            Path::new("/d/models/whisper/ggml-base.bin")
+        );
+        assert_eq!(
+            p.translate_model_dir("es"),
+            Path::new("/d/models/translate/es")
+        );
         assert_eq!(p.settings_file(), Path::new("/d/settings.json"));
     }
 

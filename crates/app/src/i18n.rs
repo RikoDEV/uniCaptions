@@ -110,7 +110,11 @@ mod tests {
     #[test]
     fn every_locale_has_exactly_the_english_keys() {
         let en = parse_locale(LOCALE_SOURCES[0].1);
-        assert!(en.len() > 100, "english table suspiciously small: {}", en.len());
+        assert!(
+            en.len() > 100,
+            "english table suspiciously small: {}",
+            en.len()
+        );
         for (code, json) in LOCALE_SOURCES {
             let t = parse_locale(json);
             let mut missing: Vec<_> = en.keys().filter(|k| !t.contains_key(*k)).collect();
@@ -151,7 +155,9 @@ mod tests {
         i.set_language("pl");
         assert_eq!(i.language(), "pl");
         assert_ne!(i.t("nav.general"), "General");
-        assert!(i.tr("about.version", &[("version", "1.2.3")]).contains("1.2.3"));
+        assert!(i
+            .tr("about.version", &[("version", "1.2.3")])
+            .contains("1.2.3"));
     }
 
     #[test]

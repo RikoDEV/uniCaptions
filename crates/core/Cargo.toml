@@ -19,7 +19,16 @@ ndarray = "0.16"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 dirs = "7"
 
+# keyring 3.x has NO default credential store: without one of these features it
+# silently falls back to an in-memory mock and API keys would never be persisted.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
 [target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
 wasapi = "0.17"
 # GPU-accelerated whisper.cpp inference via Vulkan (works across NVIDIA/AMD/Intel).
 # Requires the Vulkan SDK (with glslc/shaderc) installed on the build machine;

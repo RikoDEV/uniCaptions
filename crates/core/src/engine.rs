@@ -138,7 +138,8 @@ impl Engine {
                     }
                 }
             };
-            this.sink.emit(UiEvent::ModelDownloadFinished { kind, id, result });
+            this.sink
+                .emit(UiEvent::ModelDownloadFinished { kind, id, result });
         });
     }
 
@@ -274,7 +275,9 @@ impl Engine {
             CaptioningState::Starting(_) | CaptioningState::Idle => {}
         }
         self.sink
-            .emit(UiEvent::Caption(crate::events::CaptionEvent::clear(asr::now_ms())));
+            .emit(UiEvent::Caption(crate::events::CaptionEvent::clear(
+                asr::now_ms(),
+            )));
         self.sink.emit(UiEvent::CaptioningStopped);
     }
 
@@ -331,7 +334,11 @@ mod tests {
         let events = log.lock().unwrap();
         assert!(matches!(
             &events[0],
-            UiEvent::ModelDownloadFinished { kind: ModelKind::Whisper, result: Err(_), .. }
+            UiEvent::ModelDownloadFinished {
+                kind: ModelKind::Whisper,
+                result: Err(_),
+                ..
+            }
         ));
     }
 }

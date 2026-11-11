@@ -38,7 +38,14 @@ where
 
     let sample_rate = 48_000u32;
     let channels = 2usize;
-    let desired_format = WaveFormat::new(32, 32, &SampleType::Float, sample_rate as usize, channels, None);
+    let desired_format = WaveFormat::new(
+        32,
+        32,
+        &SampleType::Float,
+        sample_rate as usize,
+        channels,
+        None,
+    );
 
     let stream_mode = StreamMode::EventsShared {
         autoconvert: true,
@@ -48,8 +55,12 @@ where
         .initialize_client(&desired_format, &Direction::Capture, &stream_mode)
         .map_err(|e| e.to_string())?;
 
-    let h_event = audio_client.set_get_eventhandle().map_err(|e| e.to_string())?;
-    let capture_client = audio_client.get_audiocaptureclient().map_err(|e| e.to_string())?;
+    let h_event = audio_client
+        .set_get_eventhandle()
+        .map_err(|e| e.to_string())?;
+    let capture_client = audio_client
+        .get_audiocaptureclient()
+        .map_err(|e| e.to_string())?;
     let mut sample_queue: VecDeque<u8> = VecDeque::new();
 
     audio_client.start_stream().map_err(|e| e.to_string())?;
@@ -61,7 +72,9 @@ where
             .map_err(|e| e.to_string())?;
 
         while sample_queue.len() >= bytes_per_frame {
-            let bytes: Vec<u8> = sample_queue.drain(..bytes_per_frame * 512.min(sample_queue.len() / bytes_per_frame).max(1)).collect();
+            let bytes: Vec<u8> = sample_queue
+                .drain(..bytes_per_frame * 512.min(sample_queue.len() / bytes_per_frame).max(1))
+                .collect();
             #[allow(clippy::chunks_exact_to_as_chunks)]
             let samples: Vec<f32> = bytes
                 .chunks_exact(4)

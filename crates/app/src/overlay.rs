@@ -7,12 +7,12 @@
 
 use crate::color::with_alpha;
 use crate::fonts::caption_family;
-use eframe::egui::{
-    self, pos2, vec2, Align, Color32, Context, CursorIcon, FontId, Galley, Id,
-    PointerButton, Rect, Sense, Ui, ViewportBuilder, ViewportCommand, ViewportId,
-};
 use eframe::egui::text::LayoutJob;
 use eframe::egui::viewport::ResizeDirection;
+use eframe::egui::{
+    self, pos2, vec2, Align, Color32, Context, CursorIcon, FontId, Galley, Id, PointerButton, Rect,
+    Sense, Ui, ViewportBuilder, ViewportCommand, ViewportId,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -147,10 +147,26 @@ pub fn resize_hotspots(full: Rect) -> [(Rect, ResizeDirection, CursorIcon); 8] {
     let (l, r, t, bt) = (full.left(), full.right(), full.top(), full.bottom());
     let corner = |x: f32, y: f32| Rect::from_min_size(pos2(x, y), vec2(b, b));
     [
-        (corner(l, t), ResizeDirection::NorthWest, CursorIcon::ResizeNorthWest),
-        (corner(r - b, t), ResizeDirection::NorthEast, CursorIcon::ResizeNorthEast),
-        (corner(l, bt - b), ResizeDirection::SouthWest, CursorIcon::ResizeSouthWest),
-        (corner(r - b, bt - b), ResizeDirection::SouthEast, CursorIcon::ResizeSouthEast),
+        (
+            corner(l, t),
+            ResizeDirection::NorthWest,
+            CursorIcon::ResizeNorthWest,
+        ),
+        (
+            corner(r - b, t),
+            ResizeDirection::NorthEast,
+            CursorIcon::ResizeNorthEast,
+        ),
+        (
+            corner(l, bt - b),
+            ResizeDirection::SouthWest,
+            CursorIcon::ResizeSouthWest,
+        ),
+        (
+            corner(r - b, bt - b),
+            ResizeDirection::SouthEast,
+            CursorIcon::ResizeSouthEast,
+        ),
         (
             Rect::from_min_max(pos2(l + b, t), pos2(r - b, t + b)),
             ResizeDirection::North,
@@ -217,18 +233,47 @@ fn compute_layout(
     let mut rows_used = 0usize;
 
     if style.show_original && !view.text.trim().is_empty() {
-        let g = layout(ctx, view.text.trim(), font.clone(), color, max_text_w, max_lines as usize);
+        let g = layout(
+            ctx,
+            view.text.trim(),
+            font.clone(),
+            color,
+            max_text_w,
+            max_lines as usize,
+        );
         rows_used = g.rows.len();
-        blocks.push(Block { galley: g, gap_above: 0.0 });
+        blocks.push(Block {
+            galley: g,
+            gap_above: 0.0,
+        });
     }
     if style.show_translation {
-        if let Some(tr) = view.translated.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if let Some(tr) = view
+            .translated
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             let budget = translation_row_budget(max_lines, rows_used);
             if budget > 0 {
                 let tfont = FontId::new(font.size * TRANSLATION_SCALE, caption_family());
-                let g = layout(ctx, tr, tfont, color.gamma_multiply(TRANSLATION_SCALE), max_text_w, budget);
-                let gap = if blocks.is_empty() { 0.0 } else { TRANSLATION_GAP };
-                blocks.push(Block { galley: g, gap_above: gap });
+                let g = layout(
+                    ctx,
+                    tr,
+                    tfont,
+                    color.gamma_multiply(TRANSLATION_SCALE),
+                    max_text_w,
+                    budget,
+                );
+                let gap = if blocks.is_empty() {
+                    0.0
+                } else {
+                    TRANSLATION_GAP
+                };
+                blocks.push(Block {
+                    galley: g,
+                    gap_above: gap,
+                });
             }
         }
     }
@@ -303,7 +348,8 @@ fn paint_caption(
     );
 
     let bg = with_alpha(&style.background_color, [0, 0, 0], style.background_opacity);
-    ui.painter().rect_filled(box_rect, egui::CornerRadius::same(CORNER_RADIUS), bg);
+    ui.painter()
+        .rect_filled(box_rect, egui::CornerRadius::same(CORNER_RADIUS), bg);
 
     let outline = Color32::from_rgba_unmultiplied(0, 0, 0, 150);
     let mut y = box_rect.top() + PAD_Y;
@@ -326,7 +372,11 @@ fn paint_caption(
     }
 
     if interactive {
-        let drag = ui.interact(box_rect, Id::unique("overlay-drag"), Sense::click_and_drag());
+        let drag = ui.interact(
+            box_rect,
+            Id::unique("overlay-drag"),
+            Sense::click_and_drag(),
+        );
         if drag.hovered() || drag.dragged() {
             ctx.set_cursor_icon(CursorIcon::Grab);
         }
@@ -419,14 +469,22 @@ mod tests {
         for (i, (a, _, _)) in spots.iter().enumerate() {
             assert!(full.contains_rect(*a), "hotspot {i} outside window");
             for (j, (b, _, _)) in spots.iter().enumerate().skip(i + 1) {
-                assert!(!a.intersects(*b) || a.intersect(*b).area() < 0.01, "{i} overlaps {j}");
+                assert!(
+                    !a.intersects(*b) || a.intersect(*b).area() < 0.01,
+                    "{i} overlaps {j}"
+                );
             }
         }
     }
 
     #[test]
     fn near_has_half_pixel_tolerance() {
-        let a = OverlayWindowState { x: 10.0, y: 10.0, width: 900.0, height: 160.0 };
+        let a = OverlayWindowState {
+            x: 10.0,
+            y: 10.0,
+            width: 900.0,
+            height: 160.0,
+        };
         let mut b = a;
         b.x += 0.3;
         assert!(near(&a, &b));
@@ -457,8 +515,14 @@ mod tests {
 
     #[test]
     fn box_grows_with_translation_and_respects_toggles() {
-        let style = CaptionStyle { max_lines: 5, ..CaptionStyle::default() };
-        let only = CaptionView { text: "Hello there".into(), translated: None };
+        let style = CaptionStyle {
+            max_lines: 5,
+            ..CaptionStyle::default()
+        };
+        let only = CaptionView {
+            text: "Hello there".into(),
+            translated: None,
+        };
         let both = CaptionView {
             text: "Hello there".into(),
             translated: Some("Hola".into()),
@@ -467,34 +531,65 @@ mod tests {
         let b = layout_in_pass(&both, &style, 900.0).unwrap();
         assert!(b.y > a.y, "translation should add height: {a:?} vs {b:?}");
 
-        let hide_tr = CaptionStyle { show_translation: false, ..style.clone() };
+        let hide_tr = CaptionStyle {
+            show_translation: false,
+            ..style.clone()
+        };
         let c = layout_in_pass(&both, &hide_tr, 900.0).unwrap();
         assert!((c.y - a.y).abs() < 0.5);
 
-        let hide_orig = CaptionStyle { show_original: false, ..style.clone() };
+        let hide_orig = CaptionStyle {
+            show_original: false,
+            ..style.clone()
+        };
         let d = layout_in_pass(&both, &hide_orig, 900.0).unwrap();
         assert!(d.y < b.y);
 
-        let none = CaptionStyle { show_original: false, show_translation: false, ..style };
+        let none = CaptionStyle {
+            show_original: false,
+            show_translation: false,
+            ..style
+        };
         assert!(layout_in_pass(&both, &none, 900.0).is_none());
     }
 
     #[test]
     fn long_text_wraps_and_is_clamped_to_max_lines() {
         let long = "word ".repeat(200);
-        let view = CaptionView { text: long, translated: None };
-        let one = CaptionStyle { max_lines: 1, ..CaptionStyle::default() };
-        let three = CaptionStyle { max_lines: 3, ..CaptionStyle::default() };
+        let view = CaptionView {
+            text: long,
+            translated: None,
+        };
+        let one = CaptionStyle {
+            max_lines: 1,
+            ..CaptionStyle::default()
+        };
+        let three = CaptionStyle {
+            max_lines: 3,
+            ..CaptionStyle::default()
+        };
         let h1 = layout_in_pass(&view, &one, 600.0).unwrap();
         let h3 = layout_in_pass(&view, &three, 600.0).unwrap();
-        assert!(h3.y > h1.y * 2.0, "3 lines should be ~3x taller: {h1:?} {h3:?}");
-        assert!(h3.x <= 600.0 - 2.0 * OUTER_MARGIN + 1.0, "box must fit in the window: {h3:?}");
+        assert!(
+            h3.y > h1.y * 2.0,
+            "3 lines should be ~3x taller: {h1:?} {h3:?}"
+        );
+        assert!(
+            h3.x <= 600.0 - 2.0 * OUTER_MARGIN + 1.0,
+            "box must fit in the window: {h3:?}"
+        );
     }
 
     #[test]
     fn cjk_text_without_spaces_still_wraps() {
-        let view = CaptionView { text: "字幕".repeat(100), translated: None };
-        let style = CaptionStyle { max_lines: 2, ..CaptionStyle::default() };
+        let view = CaptionView {
+            text: "字幕".repeat(100),
+            translated: None,
+        };
+        let style = CaptionStyle {
+            max_lines: 2,
+            ..CaptionStyle::default()
+        };
         let size = layout_in_pass(&view, &style, 500.0).unwrap();
         assert!(size.x <= 500.0, "cjk line overflowed the window: {size:?}");
     }

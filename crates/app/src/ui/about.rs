@@ -25,17 +25,21 @@ pub fn draw(ui: &mut Ui, cx: &mut Cx) {
             );
             ui.label(RichText::new("uniCaptions").size(20.0).strong());
             ui.label(
-                RichText::new(
-                    cx.t.tr("about.version", &[("version", env!("CARGO_PKG_VERSION"))]),
-                )
-                .color(pal.text_faint),
+                RichText::new(cx.t.tr("about.version", &[("version", env!("CARGO_PKG_VERSION"))]))
+                    .color(pal.text_faint),
             );
             // Centre "Created by RikoDEV" (label + link) by measuring it first.
             let created_by = cx.t.t("about.createdBy");
             let font = egui::TextStyle::Body.resolve(ui.style());
             let width = ui.fonts_mut(|f| {
-                let a = f.layout_no_wrap(created_by.clone(), font.clone(), pal.text).size().x;
-                let b = f.layout_no_wrap("RikoDEV".into(), font.clone(), pal.text).size().x;
+                let a = f
+                    .layout_no_wrap(created_by.clone(), font.clone(), pal.text)
+                    .size()
+                    .x;
+                let b = f
+                    .layout_no_wrap("RikoDEV".into(), font.clone(), pal.text)
+                    .size()
+                    .x;
                 a + b + ui.spacing().item_spacing.x
             });
             ui.allocate_ui_with_layout(

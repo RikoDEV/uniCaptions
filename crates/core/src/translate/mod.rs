@@ -1,12 +1,12 @@
 pub mod cloud;
 
+use crate::events::{EventSink, ModelKind, UiEvent};
+use crate::paths::Paths;
 use ort::session::Session;
 use ort::value::Tensor;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use crate::events::{EventSink, ModelKind, UiEvent};
-use crate::paths::Paths;
 use tokenizers::Tokenizer;
 
 /// Supported local translation targets: English -> target language, backed by
@@ -122,7 +122,10 @@ async fn download_file(
     }
     let response = reqwest::get(url).await.map_err(|e| e.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("download failed for {url}: HTTP {}", response.status()));
+        return Err(format!(
+            "download failed for {url}: HTTP {}",
+            response.status()
+        ));
     }
     let total = response.content_length().unwrap_or(0);
     let mut downloaded: u64 = 0;
@@ -203,9 +206,24 @@ async fn download_model_files(
         4,
     )
     .await?;
-    download_file(&format!("{base}/tokenizer.json"), &tokenizer_path, sink, target_lang, 2, 4)
-        .await?;
-    download_file(&format!("{base}/config.json"), &config_path, sink, target_lang, 3, 4).await?;
+    download_file(
+        &format!("{base}/tokenizer.json"),
+        &tokenizer_path,
+        sink,
+        target_lang,
+        2,
+        4,
+    )
+    .await?;
+    download_file(
+        &format!("{base}/config.json"),
+        &config_path,
+        sink,
+        target_lang,
+        3,
+        4,
+    )
+    .await?;
     sink.emit(UiEvent::ModelProgress {
         kind: ModelKind::Translate,
         id: target_lang.to_string(),
@@ -234,10 +252,9 @@ pub async fn load_translator(
         config_path,
     } = download_model_files(paths, sink, target_lang).await?;
 
-    let config_json: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(&config_path).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    let config_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
     let decoder_start_token_id = config_json
         .get("decoder_start_token_id")
         .and_then(|v| v.as_i64())
@@ -348,8 +365,8 @@ impl Translator {
         }
         let attention_mask: Vec<i64> = vec![1; seq_len];
 
-        let input_ids_tensor = Tensor::from_array(([1usize, seq_len], input_ids))
-            .map_err(|e| e.to_string())?;
+        let input_ids_tensor =
+            Tensor::from_array(([1usize, seq_len], input_ids)).map_err(|e| e.to_string())?;
         let attention_mask_tensor = Tensor::from_array(([1usize, seq_len], attention_mask.clone()))
             .map_err(|e| e.to_string())?;
 
@@ -383,13 +400,16 @@ impl Translator {
         for step in 0..MAX_OUTPUT_TOKENS {
             let use_cache_branch = step > 0;
 
-            let mut inputs: Vec<(std::borrow::Cow<str>, ort::session::SessionInputValue)> = Vec::new();
+            let mut inputs: Vec<(std::borrow::Cow<str>, ort::session::SessionInputValue)> =
+                Vec::new();
             let input_ids_tensor = Tensor::from_array(([1usize, 1usize], vec![next_input_token]))
                 .map_err(|e| e.to_string())?;
-            let encoder_hidden_tensor = Tensor::from_array((hidden_dims.clone(), hidden_vec.clone()))
-                .map_err(|e| e.to_string())?;
-            let encoder_attn_tensor = Tensor::from_array(([1usize, seq_len], attention_mask.clone()))
-                .map_err(|e| e.to_string())?;
+            let encoder_hidden_tensor =
+                Tensor::from_array((hidden_dims.clone(), hidden_vec.clone()))
+                    .map_err(|e| e.to_string())?;
+            let encoder_attn_tensor =
+                Tensor::from_array(([1usize, seq_len], attention_mask.clone()))
+                    .map_err(|e| e.to_string())?;
             let use_cache_branch_tensor = Tensor::from_array(([1usize], vec![use_cache_branch]))
                 .map_err(|e| e.to_string())?;
 
@@ -420,10 +440,22 @@ impl Translator {
                 ))
                 .map_err(|e| e.to_string())?;
 
-                inputs.push((format!("past_key_values.{i}.decoder.key").into(), dec_key.into()));
-                inputs.push((format!("past_key_values.{i}.decoder.value").into(), dec_value.into()));
-                inputs.push((format!("past_key_values.{i}.encoder.key").into(), enc_key.into()));
-                inputs.push((format!("past_key_values.{i}.encoder.value").into(), enc_value.into()));
+                inputs.push((
+                    format!("past_key_values.{i}.decoder.key").into(),
+                    dec_key.into(),
+                ));
+                inputs.push((
+                    format!("past_key_values.{i}.decoder.value").into(),
+                    dec_value.into(),
+                ));
+                inputs.push((
+                    format!("past_key_values.{i}.encoder.key").into(),
+                    enc_key.into(),
+                ));
+                inputs.push((
+                    format!("past_key_values.{i}.encoder.value").into(),
+                    enc_value.into(),
+                ));
             }
 
             let decoder_outputs = self.decoder.run(inputs).map_err(|e| e.to_string())?;
@@ -434,16 +466,20 @@ impl Translator {
             let vocab_size = *logits_shape.last().ok_or("empty logits shape")? as usize;
             let last_step_logits = &logits_data[0..vocab_size];
 
-            let (next_token, _) = last_step_logits
-                .iter()
-                .enumerate()
-                .fold((0usize, f32::MIN), |acc, (i, &v)| {
-                    if v > acc.1 {
-                        (i, v)
-                    } else {
-                        acc
-                    }
-                });
+            let (next_token, _) =
+                last_step_logits
+                    .iter()
+                    .enumerate()
+                    .fold(
+                        (0usize, f32::MIN),
+                        |acc, (i, &v)| {
+                            if v > acc.1 {
+                                (i, v)
+                            } else {
+                                acc
+                            }
+                        },
+                    );
 
             // Pull this step's present.* outputs into the cache before
             // `decoder_outputs` (and the borrows into it) go out of scope.
@@ -463,9 +499,10 @@ impl Translator {
                     let (_, enc_key) = decoder_outputs[format!("present.{i}.encoder.key").as_str()]
                         .try_extract_tensor::<f32>()
                         .map_err(|e| e.to_string())?;
-                    let (_, enc_value) = decoder_outputs[format!("present.{i}.encoder.value").as_str()]
-                        .try_extract_tensor::<f32>()
-                        .map_err(|e| e.to_string())?;
+                    let (_, enc_value) = decoder_outputs
+                        [format!("present.{i}.encoder.value").as_str()]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| e.to_string())?;
                     layer.encoder_key = enc_key.to_vec();
                     layer.encoder_value = enc_value.to_vec();
                 }
