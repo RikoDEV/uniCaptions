@@ -15,6 +15,7 @@ mod theme;
 mod tray;
 mod ui;
 mod widgets;
+mod window_state;
 
 use eframe::egui;
 use unicaptions_core::{Paths, SettingsStore};
@@ -43,9 +44,15 @@ fn main() -> eframe::Result {
     let paths = Paths::system().expect("could not determine the user data directory");
     let store = SettingsStore::open(paths.settings_file());
 
+    // Restore the Settings window size (position stays centred: a saved
+    // position could be on a monitor that is no longer connected).
+    let (width, height) =
+        unicaptions_core::settings::OverlayWindowState::load(&paths.settings_window_file())
+            .map(|s| (s.width.clamp(720.0, 4000.0), s.height.clamp(480.0, 4000.0)))
+            .unwrap_or((900.0, 640.0));
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("uniCaptions Settings")
-        .with_inner_size([900.0, 640.0])
+        .with_inner_size([width, height])
         .with_min_inner_size([720.0, 480.0]);
     // On macOS/Linux the GL pixel format is chosen when the root window is
     // created and shared by every viewport, so the root needs an alpha channel

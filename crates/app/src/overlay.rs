@@ -15,7 +15,6 @@ use eframe::egui::{
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use unicaptions_core::settings::{OverlayWindowState, SettingsStore};
 use unicaptions_core::CaptionEvent;
 
@@ -26,7 +25,6 @@ const CORNER_RADIUS: u8 = 10;
 const TRANSLATION_SCALE: f32 = 0.85;
 const TRANSLATION_GAP: f32 = 4.0;
 const RESIZE_BAND: f32 = 8.0;
-const SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
 
 pub fn overlay_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("unicaptions-overlay")
@@ -39,12 +37,11 @@ pub struct CaptionView {
     pub translated: Option<String>,
 }
 
-#[derive(Default)]
 struct Runtime {
     /// Last click-through state we told the OS about.
     passthrough: Option<bool>,
-    last_saved: Option<OverlayWindowState>,
-    pending: Option<(OverlayWindowState, Instant)>,
+    tracker_unset: bool,
+    tracker: crate::window_state::Tracker,
 }
 
 /// State shared between the main window (which receives engine events) and the
@@ -62,7 +59,11 @@ impl OverlayShared {
             caption: Mutex::new(CaptionView::default()),
             store,
             window_file,
-            runtime: Mutex::new(Runtime::default()),
+            runtime: Mutex::new(Runtime {
+                passthrough: None,
+                tracker_unset: true,
+                tracker: crate::window_state::Tracker::default(),
+            }),
         })
     }
 
@@ -81,7 +82,10 @@ impl OverlayShared {
 /// Declares the overlay viewport. Call every frame from the main window.
 pub fn show(ctx: &Context, shared: &Arc<OverlayShared>, initial: OverlayWindowState) {
     if let Ok(mut rt) = shared.runtime.lock() {
-        rt.last_saved.get_or_insert(initial);
+        if rt.tracker_unset {
+            rt.tracker = crate::window_state::Tracker::new(Some(initial));
+            rt.tracker_unset = false;
+        }
     }
     let shared = shared.clone();
     ctx.show_viewport_deferred(
@@ -132,13 +136,6 @@ pub fn has_cjk(s: &str) -> bool {
 /// (the old CSS applied one `-webkit-line-clamp` to the whole box).
 pub fn translation_row_budget(max_lines: u32, rows_used: usize) -> usize {
     (max_lines.max(1) as usize).saturating_sub(rows_used)
-}
-
-fn near(a: &OverlayWindowState, b: &OverlayWindowState) -> bool {
-    (a.x - b.x).abs() < 0.5
-        && (a.y - b.y).abs() < 0.5
-        && (a.width - b.width).abs() < 0.5
-        && (a.height - b.height).abs() < 0.5
 }
 
 /// The eight invisible resize handles along the window edges.
@@ -323,7 +320,9 @@ fn render(ui: &mut Ui, shared: &OverlayShared) {
             }
         });
 
-    track_window(&ctx, shared);
+    if let Ok(mut rt) = shared.runtime.lock() {
+        crate::window_state::track(&ctx, &mut rt.tracker, &shared.window_file);
+    }
 }
 
 fn paint_caption(
@@ -395,48 +394,6 @@ fn paint_caption(
     }
 }
 
-/// Persists the window position/size once it has been stable for a moment
-/// (replaces `tauri-plugin-window-state`).
-fn track_window(ctx: &Context, shared: &OverlayShared) {
-    let (outer, inner) = ctx.input(|i| {
-        let v = i.viewport();
-        (v.outer_rect, v.inner_rect)
-    });
-    let (Some(outer), Some(inner)) = (outer, inner) else {
-        return;
-    };
-    let current = OverlayWindowState {
-        x: outer.min.x,
-        y: outer.min.y,
-        width: inner.width(),
-        height: inner.height(),
-    };
-    let Ok(mut rt) = shared.runtime.lock() else {
-        return;
-    };
-    if rt.last_saved.as_ref().is_some_and(|s| near(s, &current)) {
-        rt.pending = None;
-        return;
-    }
-    match rt.pending {
-        Some((p, since)) if near(&p, &current) => {
-            let elapsed = since.elapsed();
-            if elapsed >= SAVE_DEBOUNCE {
-                if current.save(&shared.window_file).is_ok() {
-                    rt.last_saved = Some(current);
-                }
-                rt.pending = None;
-            } else {
-                ctx.request_repaint_after(SAVE_DEBOUNCE - elapsed + Duration::from_millis(20));
-            }
-        }
-        _ => {
-            rt.pending = Some((current, Instant::now()));
-            ctx.request_repaint_after(SAVE_DEBOUNCE + Duration::from_millis(50));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,21 +432,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn near_has_half_pixel_tolerance() {
-        let a = OverlayWindowState {
-            x: 10.0,
-            y: 10.0,
-            width: 900.0,
-            height: 160.0,
-        };
-        let mut b = a;
-        b.x += 0.3;
-        assert!(near(&a, &b));
-        b.x += 1.0;
-        assert!(!near(&a, &b));
     }
 
     fn headless_ctx() -> Context {

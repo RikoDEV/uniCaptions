@@ -74,6 +74,7 @@ pub struct UniApp {
     autostart: Box<dyn Autostart>,
     tray: Option<Tray>,
     settings_visible: Arc<AtomicBool>,
+    window_tracker: crate::window_state::Tracker,
 }
 
 impl UniApp {
@@ -184,6 +185,7 @@ impl UniApp {
             });
         }
 
+        let paths_for_tracker = paths.settings_window_file();
         Ok(Self {
             engine,
             store,
@@ -199,6 +201,9 @@ impl UniApp {
             autostart: Box::new(SystemAutostart::new()),
             tray,
             settings_visible,
+            window_tracker: crate::window_state::Tracker::new(
+                unicaptions_core::settings::OverlayWindowState::load(&paths_for_tracker),
+            ),
         })
     }
 
@@ -304,6 +309,12 @@ impl eframe::App for UniApp {
             self.store.set(settings);
             ctx.request_repaint_of(overlay_viewport_id());
         }
+
+        crate::window_state::track(
+            &ctx,
+            &mut self.window_tracker,
+            &self.paths.settings_window_file(),
+        );
 
         // Keep the level meter / progress bars moving while active.
         if self.st.mic_active

@@ -63,6 +63,11 @@ impl Paths {
         self.config_dir.join("overlay-window.json")
     }
 
+    /// Size/position of the Settings window.
+    pub fn settings_window_file(&self) -> PathBuf {
+        self.config_dir.join("settings-window.json")
+    }
+
     pub fn whisper_model_file(&self, size: &str) -> PathBuf {
         self.data_dir
             .join("models")
