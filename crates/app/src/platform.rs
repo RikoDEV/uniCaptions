@@ -84,8 +84,8 @@ pub fn strip_overlay_chrome() -> bool {
     true
 }
 
-/// Makes the overlay visible on every virtual desktop / Space (the old Tauri
-/// build set `visibleOnAllWorkspaces`). Best effort, called repeatedly until it
+/// Makes the overlay visible on every virtual desktop / Space (earlier
+/// versions had a "visible on all workspaces" overlay). Best effort, called repeatedly until it
 /// returns `true` (window found and updated, or nothing can be done here).
 ///
 /// * macOS: `NSWindow.collectionBehavior` = CanJoinAllSpaces | Stationary |

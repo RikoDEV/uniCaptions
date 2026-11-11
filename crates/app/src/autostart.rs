@@ -1,6 +1,5 @@
-//! Launch-at-login, via the `auto-launch` crate (the same one the Tauri
-//! autostart plugin wrapped, and with the same app name so existing entries
-//! are recognised).
+//! Launch-at-login, via the `auto-launch` crate. The app name is the same one
+//! earlier versions registered, so existing entries are recognised.
 
 pub trait Autostart: Send + Sync {
     fn is_enabled(&self) -> bool;

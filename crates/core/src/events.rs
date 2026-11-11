@@ -1,8 +1,7 @@
 //! Events flowing from the engine's worker threads to the UI.
 //!
-//! This replaces Tauri's `app.emit(...)`: core code only knows about the
-//! [`EventSink`] trait, and the GUI crate implements it with a channel plus a
-//! repaint request.
+//! Core code only knows about the [`EventSink`] trait; the GUI crate implements
+//! it with a channel plus a repaint request.
 
 use std::sync::Arc;
 

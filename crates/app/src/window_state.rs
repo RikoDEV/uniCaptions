@@ -1,5 +1,4 @@
-//! Debounced persistence of a window's position and size (replaces
-//! `tauri-plugin-window-state`).
+//! Debounced persistence of a window's position and size.
 
 use eframe::egui::Context;
 use std::path::Path;

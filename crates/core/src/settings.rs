@@ -1,8 +1,7 @@
 //! Persistent user settings.
 //!
-//! The on-disk format is identical to what `tauri-plugin-store` wrote for the
-//! previous version: `settings.json` containing `{ "settings": { ... } }` with
-//! camelCase keys. Missing keys fall back to defaults (deeply, for
+//! The on-disk format is unchanged from earlier versions: `settings.json`
+//! containing `{ "settings": { ... } }` with camelCase keys. Missing keys fall back to defaults (deeply, for
 //! `captionStyle`), so older and partial files keep loading.
 
 use serde::{Deserialize, Serialize};

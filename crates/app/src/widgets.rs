@@ -1,5 +1,4 @@
-//! Custom egui widgets replacing the React components (`Toggle`,
-//! `CardSelect`, level meter, panels, sidebar nav items).
+//! Custom egui widgets: toggle, card select, level meter, panels, sidebar nav items.
 
 use crate::icons::{Flag, Icon};
 use crate::theme::Palette;

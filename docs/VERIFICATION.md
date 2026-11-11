@@ -1,6 +1,6 @@
 # Rewrite verification record
 
-Status of the Tauri → Rust/egui rewrite, per platform. "Verified" means it was
+Status of the pure-Rust (egui) rewrite, per platform. "Verified" means it was
 run on real hardware/OS, not just compiled.
 
 ## Windows 11 — verified
@@ -58,7 +58,7 @@ transparent root viewport (needed for the overlay's GL alpha); tray on the main 
 
 ## Known gaps (not implemented)
 
-- **Overlay on all virtual desktops/workspaces** (old `visibleOnAllWorkspaces`):
+- **Overlay on all virtual desktops/workspaces** (a feature of earlier versions):
   implemented best-effort in `crates/app/src/platform.rs::follow_workspaces`, but
   **not behaviourally verified anywhere**.
   - macOS: sets `NSWindow.collectionBehavior` (CanJoinAllSpaces | Stationary |

@@ -1,5 +1,5 @@
-//! The engine: everything the old `#[tauri::command]` functions did, as
-//! plain methods the UI can call. Long-running work happens on an owned tokio
+//! The engine: all captioning, audio, model and API-key operations as plain
+//! methods the UI can call. Long-running work happens on an owned tokio
 //! runtime or dedicated threads and reports back through [`UiEvent`]s.
 
 use crate::asr::{self, AsrConfig, CaptioningHandle, TranslateConfig};

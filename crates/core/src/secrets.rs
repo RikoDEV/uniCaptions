@@ -41,7 +41,7 @@ pub enum ApiProvider {
 }
 
 impl ApiProvider {
-    /// Keyring entry name. Unchanged from the Tauri version so keys saved
+    /// Keyring entry name. Unchanged from earlier versions so keys saved
     /// there keep working.
     pub fn secret_key(self) -> &'static str {
         match self {

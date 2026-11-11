@@ -1,8 +1,8 @@
 //! Filesystem locations.
 //!
-//! These intentionally resolve to the same directories the previous Tauri
-//! build used (identifier `com.unicaptions.app`), so existing downloaded
-//! models, `settings.json` and window state keep working after the rewrite.
+//! These intentionally resolve to the same directories earlier versions of
+//! the app used (identifier `com.unicaptions.app`), so existing downloaded
+//! models and `settings.json` keep working after the rewrite.
 
 use std::path::{Path, PathBuf};
 
@@ -52,13 +52,12 @@ impl Paths {
         &self.config_dir
     }
 
-    /// `settings.json` lives in the data dir (where tauri-plugin-store put it).
+    /// `settings.json` lives in the data dir (same place earlier versions kept it).
     pub fn settings_file(&self) -> PathBuf {
         self.data_dir.join("settings.json")
     }
 
-    /// `.window-state.json` lived in the config dir with tauri-plugin-window-state;
-    /// we use our own file next to it rather than reusing that format.
+    /// Overlay window placement, in the config dir.
     pub fn window_state_file(&self) -> PathBuf {
         self.config_dir.join("overlay-window.json")
     }
