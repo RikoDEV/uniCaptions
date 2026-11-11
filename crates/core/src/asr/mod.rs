@@ -17,19 +17,27 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 const WHISPER_SIZES: [&str; 4] = ["tiny", "base", "small", "medium"];
 const TARGET_SAMPLE_RATE: u32 = 16_000;
-/// Audio context handed to whisper per inference call. Kept at 3s for
-/// transcription quality (shorter windows starve whisper of context and hurt
-/// accuracy); latency is instead cut by sliding this window forward in
-/// smaller STEP_SECONDS increments rather than shrinking it. See
-/// STEP_SECONDS below.
-const WINDOW_SECONDS: usize = 3;
-/// How far the window advances (and how often we transcribe) between calls.
-/// Smaller than WINDOW_SECONDS so windows overlap: this is the same
-/// step/length/overlap approach whisper.cpp's own streaming example uses.
-/// Roughly halves the wait for a caption update vs. re-filling the whole
-/// window from empty, at the cost of ~2x more whisper calls per second of
-/// audio (mitigated by GPU acceleration where available).
-const STEP_SECONDS: f32 = 1.5;
+/// Longest audio context handed to whisper per call. Longer context gives
+/// better accuracy; shorter windows keep the text responsive.
+const WINDOW_SECONDS: f32 = 3.0;
+/// Local models are fast (tens to a few hundred ms per window on a GPU), so we
+/// show a first caption as soon as there is this much audio and then refresh
+/// it every `LOCAL_STEP_SECONDS` of new audio over a rolling window. (The old
+/// design waited to fill a whole 3 s window and then fired every 1.5 s, which
+/// added 2-4.5 s of avoidable delay.)
+const LOCAL_MIN_SECONDS: f32 = 1.0;
+const LOCAL_STEP_SECONDS: f32 = 0.4;
+/// Cloud ASR costs money per request and has network latency, so it keeps a
+/// coarser cadence.
+const CLOUD_MIN_SECONDS: f32 = 1.5;
+const CLOUD_STEP_SECONDS: f32 = 1.5;
+/// A caption is cleared once this much trailing audio is silent. Holding it a
+/// little keeps captions readable across short pauses.
+const SILENCE_HOLD_SECONDS: f32 = 1.5;
+/// How often the worker checks for new audio.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Level-meter events are emitted at most this often.
+const LEVEL_INTERVAL: Duration = Duration::from_millis(100);
 const SILENCE_RMS_THRESHOLD: f32 = 0.004;
 /// Cap on whisper.cpp threads: beyond this, per-thread scheduling overhead
 /// outweighs the gains on the short (few-second) windows we transcribe.
@@ -425,6 +433,43 @@ pub fn transcribe_samples(
     transcribe_local(&mut state, samples_16k, language)
 }
 
+/// When to run the recogniser, in samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cadence {
+    window: usize,
+    min: usize,
+    step: usize,
+}
+
+impl Cadence {
+    fn new(local: bool) -> Self {
+        let samples = |secs: f32| (TARGET_SAMPLE_RATE as f32 * secs) as usize;
+        let (min, step) = if local {
+            (LOCAL_MIN_SECONDS, LOCAL_STEP_SECONDS)
+        } else {
+            (CLOUD_MIN_SECONDS, CLOUD_STEP_SECONDS)
+        };
+        Self {
+            window: samples(WINDOW_SECONDS),
+            min: samples(min),
+            step: samples(step),
+        }
+    }
+
+    /// `buffered` samples are available, `new_since_last` of them arrived since
+    /// the previous run.
+    fn ready(&self, buffered: usize, new_since_last: usize) -> bool {
+        buffered >= self.min && new_since_last >= self.step
+    }
+}
+
+/// Is any 100 ms frame within the trailing `hold` samples louder than `threshold`?
+fn has_recent_speech(samples: &[f32], hold: usize, threshold: f32) -> bool {
+    const FRAME: usize = (TARGET_SAMPLE_RATE as usize) / 10;
+    let tail = &samples[samples.len().saturating_sub(hold)..];
+    tail.chunks(FRAME).any(|f| audio::rms(f) >= threshold)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_asr_loop(
     whisper_ctx: Option<WhisperContext>,
@@ -437,9 +482,8 @@ fn run_asr_loop(
     language: String,
     translate_slot: Option<Arc<TranslateSlot>>,
 ) {
-    let window_size = TARGET_SAMPLE_RATE as usize * WINDOW_SECONDS;
-    let step_size = (TARGET_SAMPLE_RATE as f32 * STEP_SECONDS) as usize;
-    let overlap_size = window_size - step_size;
+    let cadence = Cadence::new(cloud_asr_key.is_none());
+    let silence_hold = (TARGET_SAMPLE_RATE as f32 * SILENCE_HOLD_SECONDS) as usize;
     let mut whisper_state = whisper_ctx
         .as_ref()
         .and_then(|ctx| match ctx.create_state() {
@@ -449,17 +493,26 @@ fn run_asr_loop(
                 None
             }
         });
+    // The first inference on a GPU backend compiles its compute pipelines,
+    // which can take ~2 s. Pay that now, on silence, so the first real caption
+    // is not delayed by it (audio keeps buffering meanwhile).
+    if let Some(state) = whisper_state.as_mut() {
+        let silence = vec![0.0f32; TARGET_SAMPLE_RATE as usize];
+        let _ = transcribe_local(state, &silence, &language);
+    }
     let mut last_caption_was_empty = true;
+    // Buffer length right after the previous run, to count newly arrived audio.
+    let mut seen_len = 0usize;
+    let mut last_level_emit = std::time::Instant::now();
 
     while !stop_flag.load(Ordering::SeqCst) {
-        // Poll cadence, not the transcription latency floor: the window
-        // still has to fill (WINDOW_SECONDS) before there's anything new to
-        // transcribe, but a shorter poll means less time waiting to notice
-        // that it has.
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(POLL_INTERVAL);
 
-        if let Ok(lvl) = level.lock() {
-            sink.emit(UiEvent::AudioLevel(*lvl));
+        if last_level_emit.elapsed() >= LEVEL_INTERVAL {
+            last_level_emit = std::time::Instant::now();
+            if let Ok(lvl) = level.lock() {
+                sink.emit(UiEvent::AudioLevel(*lvl));
+            }
         }
 
         let chunk = {
@@ -467,30 +520,22 @@ fn run_asr_loop(
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            if buf.len() < window_size {
+            let new_since_last = buf.len().saturating_sub(seen_len);
+            if !cadence.ready(buf.len(), new_since_last) {
                 continue;
             }
             // Always transcribe the most recent window, not the oldest
-            // backlog. Transcription is synchronous and can occasionally
-            // run slower than real-time (bigger model, slower CPU); if we
-            // only ever drained from the front, the buffer would keep
-            // growing and captions would fall further and further behind.
-            // Dropping stale audio keeps captions live instead of catching
-            // up through a growing queue.
-            let start = buf.len() - window_size;
+            // backlog: if inference is ever slower than real time (bigger
+            // model, slower CPU) captions stay live instead of falling
+            // further behind. The buffer keeps just one window of history.
+            let start = buf.len().saturating_sub(cadence.window);
             let chunk: Vec<f32> = buf[start..].to_vec();
-            // Keep only the trailing `overlap_size` samples (the second
-            // half of this window) so the next window slides forward by
-            // `step_size` instead of starting from empty — this is what
-            // lets us transcribe every STEP_SECONDS instead of waiting a
-            // full WINDOW_SECONDS between captions. Also correctly drops
-            // any backlog beyond one window, same as the old buf.clear().
-            let keep_from = buf.len() - overlap_size;
-            buf.drain(0..keep_from);
+            buf.drain(0..start);
+            seen_len = buf.len();
             chunk
         };
 
-        if audio::rms(&chunk) < SILENCE_RMS_THRESHOLD {
+        if !has_recent_speech(&chunk, silence_hold, SILENCE_RMS_THRESHOLD) {
             // Speech has stopped (e.g. a paused video) — clear the overlay
             // instead of leaving the last caption stuck on screen forever.
             if !last_caption_was_empty {
@@ -563,4 +608,122 @@ pub(crate) fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod latency_profile {
+    use super::*;
+    use std::time::Instant;
+
+    fn read_wav_16k(path: &str) -> Vec<f32> {
+        let bytes = std::fs::read(path).unwrap();
+        let (mut pos, mut rate, mut ch) = (12usize, 0u32, 1u16);
+        let mut data: &[u8] = &[];
+        while pos + 8 <= bytes.len() {
+            let id = &bytes[pos..pos + 4];
+            let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let body = &bytes[pos + 8..(pos + 8 + size).min(bytes.len())];
+            if id == b"fmt " {
+                ch = u16::from_le_bytes(body[2..4].try_into().unwrap());
+                rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            } else if id == b"data" {
+                data = body;
+            }
+            pos += 8 + size + (size & 1);
+        }
+        #[allow(clippy::chunks_exact_to_as_chunks)]
+        let il: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+        audio::resample_linear(&audio::downmix(&il, ch as usize), rate, 16_000)
+    }
+
+    /// Prints per-call inference time for different window sizes and models.
+    /// `UNICAPTIONS_TEST_WAV=... UNICAPTIONS_TEST_MODELS=tiny=<path>,base=<path> cargo test --release -p unicaptions-core latency_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore = "profiling aid; needs models and a wav"]
+    fn inference_time_per_window() {
+        let samples = read_wav_16k(&std::env::var("UNICAPTIONS_TEST_WAV").unwrap());
+        for spec in std::env::var("UNICAPTIONS_TEST_MODELS").unwrap().split(',') {
+            let (name, path) = spec.split_once('=').unwrap();
+            let t = Instant::now();
+            let ctx =
+                WhisperContext::new_with_params(path, WhisperContextParameters::default()).unwrap();
+            let mut state = ctx.create_state().unwrap();
+            println!("[{name}] model load + state: {:?}", t.elapsed());
+            for secs in [3.0f32, 3.0, 3.0, 1.5, 1.0, 3.0] {
+                let n = (secs * 16_000.0) as usize;
+                let chunk = &samples[16_000..(16_000 + n).min(samples.len())];
+                let t = Instant::now();
+                let text = transcribe_local(&mut state, chunk, "en").unwrap();
+                println!("[{name}] {secs}s window -> {:?}  {text:?}", t.elapsed());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::*;
+
+    #[test]
+    fn local_cadence_shows_a_caption_after_one_second() {
+        let c = Cadence::new(true);
+        assert_eq!(c.window, 48_000);
+        assert!(!c.ready(8_000, 8_000), "0.5 s is too little audio");
+        assert!(c.ready(16_000, 16_000), "1 s of audio fires immediately");
+        assert!(!c.ready(40_000, 3_000), "wait for ~0.4 s of new audio");
+        assert!(c.ready(40_000, 6_400));
+    }
+
+    #[test]
+    fn cloud_cadence_is_coarser() {
+        let c = Cadence::new(false);
+        assert!(!c.ready(16_000, 16_000));
+        assert!(c.ready(24_000, 24_000));
+        assert!(!c.ready(48_000, 12_000));
+    }
+
+    #[test]
+    fn first_caption_latency_is_a_fraction_of_the_old_design() {
+        // Old design: nothing until 3 s of audio were buffered.
+        let c = Cadence::new(true);
+        let first_ready_secs = (1..=1000)
+            .map(|i| i * 160) // 10 ms of audio per tick
+            .find(|&n| c.ready(n, n))
+            .unwrap() as f32
+            / 16_000.0;
+        assert!(first_ready_secs <= 1.01, "{first_ready_secs}");
+    }
+
+    #[test]
+    fn detects_recent_speech_only_in_the_trailing_window() {
+        let mut audio = vec![0.0f32; 48_000];
+        // speech early in the window, silence for the last 2 s
+        for s in &mut audio[..16_000] {
+            *s = 0.2;
+        }
+        let hold = 24_000;
+        assert!(!has_recent_speech(&audio, hold, 0.004));
+        assert!(has_recent_speech(&audio, 48_000, 0.004));
+        // speech right at the end
+        for s in &mut audio[44_000..] {
+            *s = 0.2;
+        }
+        assert!(has_recent_speech(&audio, hold, 0.004));
+        assert!(!has_recent_speech(&[], hold, 0.004));
+    }
+
+    #[test]
+    fn a_short_word_in_a_long_silent_window_still_counts_as_speech() {
+        // The old whole-window RMS check diluted a short utterance below the
+        // threshold, delaying the first caption.
+        let mut audio = vec![0.0f32; 48_000];
+        for s in &mut audio[40_000..43_200] {
+            *s = 0.15;
+        }
+        assert!(audio::rms(&audio) < 0.05);
+        assert!(has_recent_speech(&audio, 24_000, SILENCE_RMS_THRESHOLD));
+    }
 }

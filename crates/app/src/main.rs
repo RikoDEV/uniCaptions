@@ -8,6 +8,7 @@ mod fonts;
 mod i18n;
 mod icons;
 mod overlay;
+mod platform;
 mod state;
 #[cfg(test)]
 mod testutil;

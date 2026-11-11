@@ -115,10 +115,19 @@ fn live_pipeline_captions_system_audio_loopback() {
     );
 
     let events = Arc::new(Mutex::new(Vec::<UiEvent>::new()));
-    let log = events.clone();
+    let stamps = Arc::new(Mutex::new(Vec::<(Instant, String)>::new()));
+    let (log, stamp_log) = (events.clone(), stamps.clone());
     let engine = Engine::new(
         paths,
-        Arc::new(FnSink(move |e| log.lock().unwrap().push(e))),
+        Arc::new(FnSink(move |e| {
+            if let UiEvent::Caption(c) = &e {
+                stamp_log
+                    .lock()
+                    .unwrap()
+                    .push((Instant::now(), c.text.clone()));
+            }
+            log.lock().unwrap().push(e);
+        })),
     )
     .unwrap();
 
@@ -127,7 +136,11 @@ fn live_pipeline_captions_system_audio_loopback() {
         target_language: None,
         audio_source: AudioSource::System,
         asr_provider: Provider::Local,
-        asr_model: WhisperSize::Tiny,
+        asr_model: match std::env::var("UNICAPTIONS_TEST_ASR_MODEL").as_deref() {
+            Ok("base") => WhisperSize::Base,
+            Ok("small") => WhisperSize::Small,
+            _ => WhisperSize::Tiny,
+        },
         translate_provider: Provider::Local,
     });
 
@@ -153,6 +166,7 @@ fn live_pipeline_captions_system_audio_loopback() {
     assert!(engine.is_captioning_active());
 
     // Play the speech (blocking) through the speakers; loopback hears it.
+    let play_started = Instant::now();
     let status = std::process::Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -176,6 +190,12 @@ fn live_pipeline_captions_system_audio_loopback() {
         })
         .collect();
     println!("captions: {captions:#?}");
+    for (at, text) in stamps.lock().unwrap().iter().filter(|(_, t)| !t.is_empty()) {
+        println!(
+            "  +{:>5.2}s after player launch: {text:?}",
+            at.duration_since(play_started).as_secs_f32()
+        );
+    }
     let levels = ev
         .iter()
         .filter(|e| matches!(e, UiEvent::AudioLevel(l) if *l > 0.01))

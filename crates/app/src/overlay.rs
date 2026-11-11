@@ -41,6 +41,7 @@ struct Runtime {
     /// Last click-through state we told the OS about.
     passthrough: Option<bool>,
     tracker_unset: bool,
+    chrome_stripped: bool,
     tracker: crate::window_state::Tracker,
 }
 
@@ -62,6 +63,7 @@ impl OverlayShared {
             runtime: Mutex::new(Runtime {
                 passthrough: None,
                 tracker_unset: true,
+                chrome_stripped: false,
                 tracker: crate::window_state::Tracker::default(),
             }),
         })
@@ -97,7 +99,7 @@ pub fn show(ctx: &Context, shared: &Arc<OverlayShared>, initial: OverlayWindowSt
 
 pub fn viewport_builder(state: OverlayWindowState) -> ViewportBuilder {
     ViewportBuilder::default()
-        .with_title("uniCaptions")
+        .with_title(crate::platform::OVERLAY_TITLE)
         .with_position(pos2(state.x, state.y))
         .with_inner_size(vec2(state.width, state.height))
         .with_min_inner_size(vec2(240.0, 70.0))
@@ -108,6 +110,8 @@ pub fn viewport_builder(state: OverlayWindowState) -> ViewportBuilder {
         .with_mouse_passthrough(true)
         .with_active(false)
         .with_resizable(true)
+        // macOS: a shadow around a transparent window leaves ghosting artifacts.
+        .with_has_shadow(false)
 }
 
 // ---- pure helpers ------------------------------------------------------------
@@ -299,6 +303,14 @@ fn render(ui: &mut Ui, shared: &OverlayShared) {
     let settings = shared.store.get();
     let view = shared.caption();
     let has_text = !view.text.trim().is_empty();
+
+    // Windows draws a shadow/border/rounded frame around undecorated windows;
+    // remove it (retried until the native window exists).
+    if let Ok(mut rt) = shared.runtime.lock() {
+        if !rt.chrome_stripped {
+            rt.chrome_stripped = crate::platform::strip_overlay_chrome();
+        }
+    }
 
     // With no caption visible there is nothing to grab or click, so the window
     // must be click-through regardless of the user's preference; otherwise the
