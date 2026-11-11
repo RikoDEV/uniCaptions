@@ -205,7 +205,7 @@ impl StreamState {
     /// kept after a cut can still hold a sliver of them, and timestamps differ a
     /// little between passes).
     fn repeated_prefix(&self, hyp: &[Word]) -> usize {
-        for k in (1..=3).rev() {
+        for k in (1..=6).rev() {
             if hyp.len() >= k
                 && self.committed.len() >= k
                 && hyp[..k]
@@ -274,6 +274,10 @@ impl StreamState {
             self.frozen_end = hyp[freeze - 1].t1;
             hyp.drain(..freeze);
         }
+        // Of the tentative words, only those the previous pass heard the same way
+        // are shown. A word that appears for one pass and is then corrected (the
+        // recogniser guessing a similar-sounding word) never reaches the screen.
+        let shown = agreed.saturating_sub(freeze).min(hyp.len());
 
         // A pause at the end: the speaker stopped, so nothing in `hyp` is still
         // being said. Freeze it all and cut inside the silence.
@@ -305,13 +309,13 @@ impl StreamState {
             }
         }
 
-        self.prev = hyp;
         let display = self.join(
             self.committed
                 .iter()
                 .cloned()
-                .chain(self.prev.iter().map(|w| w.text.clone())),
+                .chain(hyp[..shown.min(hyp.len())].iter().map(|w| w.text.clone())),
         );
+        self.prev = hyp;
         Update { display, cut_secs }
     }
 
@@ -348,17 +352,34 @@ mod tests {
         words_at(text, 0.0)
     }
 
+    /// Feeds the same hypothesis in two consecutive passes. A tentative word is
+    /// only shown once two passes agree on it, so most display checks need this.
+    fn settle(s: &mut StreamState, hyp: Vec<Word>, secs: f32) -> Update {
+        s.update(hyp.clone(), secs, TALKING);
+        s.update(hyp, secs, TALKING)
+    }
+
     #[test]
-    fn young_words_are_shown_but_not_frozen() {
+    fn a_word_is_shown_only_once_two_passes_agree_on_it() {
         let mut s = StreamState::new();
-        let u = s.update(words("hello this is"), 1.5, TALKING);
+        // first sighting: not shown yet (it may be a similar-sounding mistake)
+        let u = s.update(words("hello this is"), 1.2, TALKING);
+        assert_eq!(u.display, "");
+        // the next pass hears the same words: they appear, young, so not frozen
+        let u = s.update(words("hello this is a"), 1.2, TALKING);
         assert_eq!(u.display, "hello this is");
         assert_eq!(u.cut_secs, None);
-        assert!(s.committed.is_empty());
-        // agreement alone is not enough while the words are young
-        let u = s.update(words("hello this is a"), 1.25, TALKING);
-        assert_eq!(u.display, "hello this is a");
         assert!(s.committed.is_empty(), "{:?}", s.committed);
+    }
+
+    #[test]
+    fn a_misheard_word_that_is_corrected_never_reaches_the_screen() {
+        let mut s = StreamState::new();
+        s.update(words("na wiosce"), 1.0, TALKING);
+        let u = s.update(words("na żywo"), 1.4, TALKING);
+        assert_eq!(u.display, "na", "{}", u.display);
+        let u = s.update(words("na żywo dzisiaj"), 1.8, TALKING);
+        assert_eq!(u.display, "na żywo");
     }
 
     #[test]
@@ -368,7 +389,7 @@ mod tests {
         let u = s.update(words("hello this is a test of it"), 2.8, TALKING);
         // words that ended more than 1 s ago and were agreed on are frozen...
         assert!(s.committed.len() >= 2, "{:?}", s.committed);
-        assert_eq!(u.display, "hello this is a test of it");
+        assert_eq!(u.display, "hello this is a test");
         // ...but cutting mid-speech could lose a word, so the audio is kept
         assert_eq!(u.cut_secs, None);
     }
@@ -447,7 +468,7 @@ mod tests {
             "cut must lie inside the silence: {cut}"
         );
         // the next utterance starts from a clean window and appends
-        let u = s.update(words("epsilon zeta"), 1.0, TALKING);
+        let u = settle(&mut s, words("epsilon zeta"), 1.0);
         assert_eq!(u.display, "alpha beta gamma delta epsilon zeta");
     }
 
@@ -502,15 +523,27 @@ mod tests {
             Word::new("podpisy", 0.3, 0.8),
             Word::new("są", 0.9, 1.2),
         ];
-        let u = s.update(again, 1.4, TALKING);
+        let u = settle(&mut s, again, 1.4);
         assert_eq!(u.display.matches(last.as_str()).count(), 1, "{}", u.display);
         assert!(u.display.contains("są"), "{}", u.display);
     }
 
     #[test]
+    fn a_whole_phrase_repeated_with_shifted_timestamps_is_dropped() {
+        let mut s = StreamState::new();
+        s.update(words("dzisiaj jest ładna pogoda"), 3.2, TALKING);
+        s.update(words("dzisiaj jest ładna pogoda"), 3.6, TALKING);
+        assert_eq!(s.committed.len(), 4, "{:?}", s.committed);
+        // the recogniser reports the same phrase again, later in time, plus new words
+        let again = words_at("dzisiaj jest ładna pogoda i świeci słońce", 1.5);
+        let u = settle(&mut s, again, 5.0);
+        assert_eq!(u.display.matches("dzisiaj").count(), 1, "{}", u.display);
+    }
+
+    #[test]
     fn a_genuinely_repeated_word_in_the_first_window_is_kept() {
         let mut s = StreamState::new();
-        let u = s.update(words("no no way no"), 1.6, TALKING);
+        let u = settle(&mut s, words("no no way no"), 1.6);
         assert_eq!(u.display, "no no way no");
     }
 
@@ -564,21 +597,21 @@ mod tests {
     #[test]
     fn a_finished_sentence_starts_the_next_line() {
         let mut s = StreamState::new();
-        let u = s.update(words("to jest test. Dzisiaj jest ładnie"), 3.0, TALKING);
+        let u = settle(&mut s, words("to jest test. Dzisiaj jest ładnie"), 3.0);
         assert_eq!(u.display, "to jest test.\nDzisiaj jest ładnie");
     }
 
     #[test]
     fn abbreviations_and_numbers_do_not_break_the_line() {
         let mut s = StreamState::new();
-        let u = s.update(words("pan dr. Kowalski kupił 3. książkę"), 3.0, TALKING);
+        let u = settle(&mut s, words("pan dr. Kowalski kupił 3. książkę"), 3.0);
         assert_eq!(u.display, "pan dr. Kowalski kupił 3. książkę");
     }
 
     #[test]
     fn questions_and_exclamations_also_end_a_line() {
         let mut s = StreamState::new();
-        let u = s.update(words("co robisz? nic! dobrze"), 2.0, TALKING);
+        let u = settle(&mut s, words("co robisz? nic! dobrze"), 2.0);
         assert_eq!(u.display, "co robisz?\nnic!\ndobrze");
     }
 
@@ -593,10 +626,10 @@ mod tests {
     #[test]
     fn cjk_sentences_break_without_spaces() {
         let mut s = StreamState::new();
-        let u = s.update(
+        let u = settle(
+            &mut s,
             vec![Word::new("字幕。", 0.0, 0.5), Word::new("テスト", 0.5, 1.0)],
             1.0,
-            TALKING,
         );
         assert_eq!(u.display, "字幕。\nテスト");
     }
@@ -625,10 +658,7 @@ mod tests {
         assert!(!s.is_empty());
         s.reset();
         assert!(s.is_empty());
-        assert_eq!(
-            s.update(words("new start"), 1.0, TALKING).display,
-            "new start"
-        );
+        assert_eq!(settle(&mut s, words("new start"), 1.0).display, "new start");
     }
 
     #[test]
