@@ -42,6 +42,7 @@ struct Runtime {
     passthrough: Option<bool>,
     tracker_unset: bool,
     chrome_stripped: bool,
+    workspaces_done: bool,
     tracker: crate::window_state::Tracker,
 }
 
@@ -64,6 +65,7 @@ impl OverlayShared {
                 passthrough: None,
                 tracker_unset: true,
                 chrome_stripped: false,
+                workspaces_done: false,
                 tracker: crate::window_state::Tracker::default(),
             }),
         })
@@ -309,6 +311,9 @@ fn render(ui: &mut Ui, shared: &OverlayShared) {
     if let Ok(mut rt) = shared.runtime.lock() {
         if !rt.chrome_stripped {
             rt.chrome_stripped = crate::platform::strip_overlay_chrome();
+        }
+        if !rt.workspaces_done {
+            rt.workspaces_done = crate::platform::follow_workspaces();
         }
     }
 

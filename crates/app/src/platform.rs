@@ -83,3 +83,139 @@ pub fn strip_overlay_chrome() -> bool {
 pub fn strip_overlay_chrome() -> bool {
     true
 }
+
+/// Makes the overlay visible on every virtual desktop / Space (the old Tauri
+/// build set `visibleOnAllWorkspaces`). Best effort, called repeatedly until it
+/// returns `true` (window found and updated, or nothing can be done here).
+///
+/// * macOS: `NSWindow.collectionBehavior` = CanJoinAllSpaces | Stationary |
+///   FullScreenAuxiliary (so it also floats over full-screen apps).
+/// * Linux/X11: the EWMH `_NET_WM_STATE_STICKY` state, requested from the window manager.
+/// * Windows: there is no public API for pinning a window to all virtual
+///   desktops, so this is a no-op there. Wayland has no client-side API either.
+#[cfg(target_os = "macos")]
+pub fn follow_workspaces() -> bool {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use std::ffi::{c_char, CStr};
+
+    // NSWindowCollectionBehavior bits.
+    const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    const STATIONARY: usize = 1 << 4;
+    const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+
+    // Must run on the main thread, which is where eframe runs every viewport.
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return false;
+        }
+        let windows: *mut AnyObject = msg_send![app, windows];
+        if windows.is_null() {
+            return false;
+        }
+        let count: usize = msg_send![windows, count];
+        for i in 0..count {
+            let window: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+            if window.is_null() {
+                continue;
+            }
+            let title: *mut AnyObject = msg_send![window, title];
+            if title.is_null() {
+                continue;
+            }
+            let utf8: *const c_char = msg_send![title, UTF8String];
+            if utf8.is_null() || CStr::from_ptr(utf8).to_bytes() != OVERLAY_TITLE.as_bytes() {
+                continue;
+            }
+            let behavior = CAN_JOIN_ALL_SPACES | STATIONARY | FULL_SCREEN_AUXILIARY;
+            let _: () = msg_send![window, setCollectionBehavior: behavior];
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub fn follow_workspaces() -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, Window};
+
+    /// Give up after this many tries (e.g. under Wayland or a window manager
+    /// without EWMH support the window never shows up in `_NET_CLIENT_LIST`).
+    const MAX_ATTEMPTS: u32 = 60;
+    static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    if ATTEMPTS.fetch_add(1, Ordering::Relaxed) >= MAX_ATTEMPTS {
+        return true;
+    }
+
+    let attempt = || -> Option<bool> {
+        let (conn, screen_num) = x11rb::connect(None).ok()?;
+        let root = conn.setup().roots.get(screen_num)?.root;
+        let atom = |name: &str| -> Option<u32> {
+            Some(
+                conn.intern_atom(false, name.as_bytes())
+                    .ok()?
+                    .reply()
+                    .ok()?
+                    .atom,
+            )
+        };
+        let client_list = atom("_NET_CLIENT_LIST")?;
+        let wm_pid = atom("_NET_WM_PID")?;
+        let wm_name = atom("_NET_WM_NAME")?;
+        let utf8 = atom("UTF8_STRING")?;
+        let wm_state = atom("_NET_WM_STATE")?;
+        let sticky = atom("_NET_WM_STATE_STICKY")?;
+
+        let list = conn
+            .get_property(false, root, client_list, AtomEnum::WINDOW, 0, 4096)
+            .ok()?
+            .reply()
+            .ok()?;
+        let windows: Vec<Window> = list.value32()?.collect();
+        let my_pid = std::process::id();
+
+        for win in windows {
+            let pid = conn
+                .get_property(false, win, wm_pid, AtomEnum::CARDINAL, 0, 1)
+                .ok()?
+                .reply()
+                .ok()?
+                .value32()
+                .and_then(|mut v| v.next());
+            if pid != Some(my_pid) {
+                continue;
+            }
+            let name = conn
+                .get_property(false, win, wm_name, utf8, 0, 64)
+                .ok()?
+                .reply()
+                .ok()?;
+            if name.value != OVERLAY_TITLE.as_bytes() {
+                continue;
+            }
+            // _NET_WM_STATE client message: [action (1 = add), property, 0, source (1 = app), 0]
+            let event = ClientMessageEvent::new(32, win, wm_state, [1, sticky, 0, 1, 0]);
+            conn.send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .ok()?;
+            conn.flush().ok()?;
+            return Some(true);
+        }
+        Some(false)
+    };
+
+    // No X server reachable (pure Wayland): nothing we can do, so stop retrying.
+    attempt().unwrap_or(true)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn follow_workspaces() -> bool {
+    true
+}

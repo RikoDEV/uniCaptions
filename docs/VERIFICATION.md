@@ -58,10 +58,16 @@ transparent root viewport (needed for the overlay's GL alpha); tray on the main 
 
 ## Known gaps (not implemented)
 
-- **Overlay on all virtual desktops/workspaces.** The old Tauri build set
-  `visibleOnAllWorkspaces`. There is no public Windows API for this; macOS
-  (`NSWindowCollectionBehaviorCanJoinAllSpaces`) and X11 (`_NET_WM_DESKTOP`)
-  need native code that could not be tested here.
+- **Overlay on all virtual desktops/workspaces** (old `visibleOnAllWorkspaces`):
+  implemented best-effort in `crates/app/src/platform.rs::follow_workspaces`, but
+  **not behaviourally verified anywhere**.
+  - macOS: sets `NSWindow.collectionBehavior` (CanJoinAllSpaces | Stationary |
+    FullScreenAuxiliary) via the Objective-C runtime. Type-checked for
+    `aarch64-apple-darwin`; never run on a Mac.
+  - Linux/X11: requests EWMH `_NET_WM_STATE_STICKY` via `x11rb`. Type-checked for
+    `x86_64-unknown-linux-gnu`; never run (WSLg's window manager ignores EWMH
+    window-state hints, so it could not have confirmed it anyway).
+  - Windows: no public API exists, so it is a no-op. Wayland: no client-side API.
 - **System-audio capture on macOS/Linux** (was Windows-only before the rewrite).
 - Settings window *position* is not restored (size is), to avoid restoring onto
   a disconnected monitor.

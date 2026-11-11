@@ -34,6 +34,12 @@ serde_json = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+# Talks to the X server to ask the window manager to make the overlay sticky.
+x11rb = "0.14"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Objective-C runtime, to set NSWindow.collectionBehavior on the overlay.
+objc2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
