@@ -240,7 +240,7 @@ fn layout(
     job.wrap.max_rows = max_rows.max(1);
     job.wrap.break_anywhere = has_cjk(text);
     job.wrap.overflow_character = Some('\u{2026}');
-    job.halign = Align::Center;
+    job.halign = Align::LEFT;
     ctx.fonts_mut(|f| f.layout_job(job))
 }
 
@@ -269,10 +269,21 @@ fn layout_tail(
     layout(ctx, tail.trim_start(), font, color, width, max_rows)
 }
 
-/// One laid-out block (original or translation) and the gap above it.
+/// One laid-out block (original or translation) at a fixed offset inside the box.
 struct Block {
     galley: Arc<Galley>,
-    gap_above: f32,
+    /// Distance from the top of the text area (inside the padding).
+    y: f32,
+}
+
+/// Height of one text row for `font`.
+fn row_height(ctx: &Context, font: FontId) -> f32 {
+    let two_rows = ctx.fonts_mut(|f| {
+        f.layout_no_wrap("Ag\nAg".to_string(), font, Color32::WHITE)
+            .size()
+            .y
+    });
+    two_rows / 2.0
 }
 
 /// What would be drawn, computed without painting (testable).
@@ -290,76 +301,81 @@ fn apply_case(text: &str, uppercase: bool) -> String {
     }
 }
 
+/// Lays the caption out in a box whose size never depends on the text: it is as
+/// wide as the window allows and as tall as `max_lines` rows (plus the same for
+/// the translation when it is, or is about to be, shown). Text is left-aligned
+/// and starts at a fixed spot, so new words only extend the line instead of
+/// resizing and re-centring the box, which is what made captions "jump".
 fn compute_layout(
     ctx: &Context,
     view: &CaptionView,
     style: &unicaptions_core::settings::CaptionStyle,
     window_width: f32,
+    reserve_translation: bool,
 ) -> Option<Layout> {
     let max_text_w = (window_width - 2.0 * OUTER_MARGIN - 2.0 * PAD_X).max(60.0);
     let font = FontId::new(style.font_size.max(6.0), caption_family());
     let color = with_alpha(&style.text_color, [255, 255, 255], 1.0);
     let max_lines = style.max_lines.max(1);
 
-    let mut blocks: Vec<Block> = Vec::new();
-
-    if style.show_original && !view.text.trim().is_empty() {
-        let text = apply_case(view.text.trim(), style.uppercase);
-        let g = layout_tail(
-            ctx,
-            &text,
-            font.clone(),
-            color,
-            max_text_w,
-            max_lines as usize,
-        );
-        blocks.push(Block {
-            galley: g,
-            gap_above: 0.0,
-        });
+    let tfont = FontId::new(font.size * TRANSLATION_SCALE, caption_family());
+    let original = Some(view.text.trim())
+        .filter(|t| style.show_original && !t.is_empty())
+        .map(|t| apply_case(t, style.uppercase));
+    let translation = view
+        .translated
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| style.show_translation && !t.is_empty())
+        .map(|t| apply_case(t, style.uppercase));
+    if original.is_none() && translation.is_none() {
+        return None;
     }
-    if style.show_translation {
-        if let Some(tr) = view
-            .translated
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
-            let tfont = FontId::new(font.size * TRANSLATION_SCALE, caption_family());
-            let tr = apply_case(tr, style.uppercase);
+
+    // Space is reserved for each part that is (or will be) shown, whether or not
+    // it has text yet, so nothing shifts when the translation arrives.
+    let show_original_area = style.show_original;
+    let show_translation_area =
+        style.show_translation && (translation.is_some() || reserve_translation);
+    let original_h = row_height(ctx, font.clone()) * max_lines as f32;
+    let translation_h = row_height(ctx, tfont.clone()) * max_lines as f32;
+
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut y = 0.0f32;
+    if show_original_area {
+        if let Some(text) = &original {
             let g = layout_tail(
                 ctx,
-                &tr,
+                text,
+                font.clone(),
+                color,
+                max_text_w,
+                max_lines as usize,
+            );
+            blocks.push(Block { galley: g, y });
+        }
+        y += original_h;
+    }
+    if show_translation_area {
+        if show_original_area {
+            y += TRANSLATION_GAP;
+        }
+        if let Some(text) = &translation {
+            let g = layout_tail(
+                ctx,
+                text,
                 tfont,
                 color.gamma_multiply(TRANSLATION_SCALE),
                 max_text_w,
                 max_lines as usize,
             );
-            let gap = if blocks.is_empty() {
-                0.0
-            } else {
-                TRANSLATION_GAP
-            };
-            blocks.push(Block {
-                galley: g,
-                gap_above: gap,
-            });
+            blocks.push(Block { galley: g, y });
         }
-    }
-    if blocks.is_empty() {
-        return None;
+        y += translation_h;
     }
 
-    let content_w = blocks
-        .iter()
-        .map(|b| b.galley.rect.width())
-        .fold(0.0f32, f32::max);
-    let content_h: f32 = blocks
-        .iter()
-        .map(|b| b.gap_above + b.galley.rect.height())
-        .sum();
     Some(Layout {
-        box_size: vec2(content_w + 2.0 * PAD_X, content_h + 2.0 * PAD_Y),
+        box_size: vec2(max_text_w + 2.0 * PAD_X, y + 2.0 * PAD_Y),
         blocks,
     })
 }
@@ -417,7 +433,8 @@ fn paint_caption(
     interactive: bool,
 ) {
     let style = &settings.caption_style;
-    let Some(layout) = compute_layout(ctx, view, style, full.width()) else {
+    let Some(layout) = compute_layout(ctx, view, style, full.width(), settings.translation_enabled)
+    else {
         return;
     };
 
@@ -434,12 +451,13 @@ fn paint_caption(
         .rect_filled(box_rect, egui::CornerRadius::same(CORNER_RADIUS), bg);
 
     let outline = Color32::from_rgba_unmultiplied(0, 0, 0, 150);
-    let mut y = box_rect.top() + PAD_Y;
     for block in &layout.blocks {
-        y += block.gap_above;
         let g = &block.galley;
-        // Centre the galley's actual extent regardless of how its origin is defined.
-        let pos = pos2(box_rect.center().x - g.rect.center().x, y - g.rect.top());
+        // Left-aligned at a fixed spot, whatever the galley's origin convention.
+        let pos = pos2(
+            box_rect.left() + PAD_X - g.rect.left(),
+            box_rect.top() + PAD_Y + block.y - g.rect.top(),
+        );
         if style.outline {
             for (dx, dy) in [(1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)] {
                 ui.painter().galley_with_override_text_color(
@@ -450,7 +468,6 @@ fn paint_caption(
             }
         }
         ui.painter().galley(pos, g.clone(), Color32::WHITE);
-        y += g.rect.height();
     }
 
     if interactive {
@@ -518,7 +535,7 @@ mod tests {
         let ctx = headless_ctx();
         let mut out = None;
         crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
-            out = compute_layout(ui.ctx(), view, style, width).map(|l| l.box_size);
+            out = compute_layout(ui.ctx(), view, style, width, false).map(|l| l.box_size);
         });
         out
     }
@@ -580,7 +597,7 @@ mod tests {
         let ctx = headless_ctx();
         let mut out = Vec::new();
         crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
-            let l = compute_layout(ui.ctx(), view, style, 900.0).unwrap();
+            let l = compute_layout(ui.ctx(), view, style, 900.0, false).unwrap();
             out = l
                 .blocks
                 .iter()
@@ -606,6 +623,78 @@ mod tests {
             },
         );
         assert_eq!(on, ["DZIEŃ DOBRY", "GOOD MORNING"]);
+    }
+
+    #[test]
+    fn the_box_never_changes_size_as_the_text_grows() {
+        let style = CaptionStyle {
+            max_lines: 2,
+            ..CaptionStyle::default()
+        };
+        let sizes: Vec<_> = ["Hi", "Hello there my friend", &"word ".repeat(80)]
+            .iter()
+            .map(|t| {
+                let view = CaptionView {
+                    text: (*t).into(),
+                    translated: None,
+                };
+                layout_in_pass(&view, &style, 900.0).unwrap()
+            })
+            .collect();
+        assert_eq!(sizes[0], sizes[1], "{sizes:?}");
+        assert_eq!(sizes[1], sizes[2], "{sizes:?}");
+    }
+
+    #[test]
+    fn space_for_the_translation_is_reserved_before_it_arrives() {
+        let ctx = headless_ctx();
+        let style = CaptionStyle::default();
+        let size = |translated: Option<&str>, reserve: bool| {
+            let view = CaptionView {
+                text: "Dzień dobry".into(),
+                translated: translated.map(str::to_string),
+            };
+            let mut out = None;
+            crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
+                out = compute_layout(ui.ctx(), &view, &style, 900.0, reserve).map(|l| l.box_size);
+            });
+            out.unwrap()
+        };
+        let before = size(None, true); // translation is on, not here yet
+        let after = size(Some("Good morning"), true);
+        assert_eq!(
+            before, after,
+            "the box must not grow when the translation arrives"
+        );
+        assert!(
+            before.y > size(None, false).y,
+            "reserved space must be taller than none"
+        );
+    }
+
+    #[test]
+    fn text_is_left_aligned_not_centred() {
+        let ctx = headless_ctx();
+        let style = CaptionStyle::default();
+        let view = CaptionView {
+            text: "Short".into(),
+            translated: None,
+        };
+        let mut left = f32::MAX;
+        let mut width = 0.0;
+        crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
+            let l = compute_layout(ui.ctx(), &view, &style, 900.0, false).unwrap();
+            left = l.blocks[0].galley.rect.left();
+            width = l.blocks[0].galley.rect.width();
+        });
+        assert!(
+            left.abs() < 0.5,
+            "text must start at the left edge, started at {left}"
+        );
+        assert!(
+            width < 300.0,
+            "a short word must not be stretched across the box: {width}"
+        );
     }
 
     #[test]
@@ -748,7 +837,7 @@ mod tests {
         };
         let mut shown = String::new();
         crate::testutil::run_pass(&ctx, egui::RawInput::default(), |ui| {
-            let l = compute_layout(ui.ctx(), &view, &style, 700.0).unwrap();
+            let l = compute_layout(ui.ctx(), &view, &style, 700.0, false).unwrap();
             shown = l.blocks[0].galley.text().to_string();
             assert_eq!(l.blocks[0].galley.rows.len(), 2);
         });

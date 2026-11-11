@@ -659,50 +659,31 @@ impl SilenceTracker {
     }
 }
 
-/// Finds a cut point inside a silent gap of `audio`, within `lo..=hi` seconds.
-/// Returns the middle of the silent run closest to the middle of the range.
-fn find_silent_cut(audio: &[f32], lo: f32, hi: f32) -> Option<f32> {
+/// If `audio` ends in silence lasting at least `min_secs`, returns the time
+/// (seconds from the start of `audio`) where that silence began. "Silent" is
+/// relative to the loudness of the window, so a noisy room still has pauses.
+fn trailing_silence_start(audio: &[f32], min_secs: f32) -> Option<f32> {
     const FRAME: usize = 320; // 20 ms
-    const MIN_RUN: usize = 6; // 120 ms of silence: shorter dips occur inside words (stop consonants)
     let sr = TARGET_SAMPLE_RATE as f32;
-    if audio.len() < FRAME * MIN_RUN || hi < lo {
+    let min_frames = (min_secs * sr / FRAME as f32).ceil() as usize;
+    if audio.is_empty() || audio.len() < min_frames * FRAME {
         return None;
     }
-    // "Silent" relative to this window, so a noisy room still has gaps.
-    let threshold = (audio::rms(audio) * 0.15).max(0.003);
-    let silent: Vec<bool> = audio
-        .chunks(FRAME)
-        .map(|f| audio::rms(f) < threshold)
-        .collect();
-    let target = (lo + hi) / 2.0;
-    let mut best: Option<(f32, f32)> = None; // (distance, cut time)
-    let mut i = 0;
-    while i < silent.len() {
-        if !silent[i] {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < silent.len() && silent[i] {
-            i += 1;
-        }
-        if i - start < MIN_RUN {
-            continue;
-        }
-        let (a, b) = (
-            start as f32 * FRAME as f32 / sr,
-            i as f32 * FRAME as f32 / sr,
-        );
-        if b < lo || a > hi {
-            continue; // the run does not touch the allowed range
-        }
-        let cut = ((a + b) / 2.0).clamp(lo, hi);
-        let dist = (cut - target).abs();
-        if best.is_none_or(|(d, _)| dist < d) {
-            best = Some((dist, cut));
-        }
+    let threshold = (audio::rms(audio) * 0.15).clamp(0.003, 0.012);
+    let frames: Vec<&[f32]> = audio.chunks(FRAME).collect();
+    let silent = frames
+        .iter()
+        .rev()
+        .take_while(|f| audio::rms(f) < threshold)
+        .count();
+    if silent < min_frames {
+        return None;
     }
-    best.map(|(_, cut)| cut)
+    let start_sample: usize = frames[..frames.len() - silent]
+        .iter()
+        .map(|f| f.len())
+        .sum();
+    Some(start_sample as f32 / sr)
 }
 
 /// When to run the recogniser, in samples.
@@ -901,6 +882,17 @@ fn run_local_loop(
         }
         new_since = 0;
 
+        // Nothing but silence is buffered (everything before it is already frozen):
+        // there is nothing to transcribe, and Whisper invents words on silence.
+        let trailing = trailing_silence_start(&audio, stream::PAUSE_SECS);
+        if trailing.is_some_and(|start| start < 0.05) {
+            let keep = (sr * 0.3) as usize; // lead-in for the next word
+            if audio.len() > keep {
+                audio.drain(..audio.len() - keep);
+            }
+            continue;
+        }
+
         let result = match transcribe_words(&mut state, &audio, lang.current()) {
             Ok(r) => r,
             Err(e) => {
@@ -911,20 +903,16 @@ fn run_local_loop(
         lang.observe(result.detected_lang, !result.words.is_empty());
 
         let audio_secs = audio.len() as f32 / sr;
-        let update = stream.update(result.words, audio_secs, &|lo, hi| {
-            find_silent_cut(&audio, lo, hi)
-        });
+        let update = stream.update(result.words, audio_secs, trailing);
         if let Some(cut) = update.cut_secs {
             let n = ((cut * sr) as usize).min(audio.len());
             audio.drain(..n);
         }
 
-        if update.display.is_empty() {
-            if !last_display.is_empty() {
-                last_display.clear();
-                emit_clear(&sink, &translate_slot);
-            }
-        } else if update.display != last_display {
+        // An empty pass (Whisper heard nothing in this window) keeps what is shown:
+        // only real silence, handled above, clears the caption. Clearing here made
+        // the box blink off and on between passes.
+        if !update.display.is_empty() && update.display != last_display {
             last_display = update.display.clone();
             emit_caption(&sink, &translate_slot, update.display, lang.effective());
         }
@@ -1355,11 +1343,12 @@ mod streaming_profile {
             println!("  +{rel:5.2}s  {:?}", c.text);
             if !prev.is_empty() && !c.text.is_empty() {
                 revisions += 1;
-                // everything except the last 3 words of the previous caption
+                // everything except the last ~7 words (about 2.5 s of speech) of the previous caption
                 // must still be a prefix of the new one
                 let words: Vec<&str> = prev.split_whitespace().collect();
-                let stable = words[..words.len().saturating_sub(3)].join(" ");
-                if !c.text.starts_with(&stable) {
+                let stable = words[..words.len().saturating_sub(7)].join(" ");
+                let flat = c.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !flat.starts_with(&stable) {
                     regress += 1;
                     println!("    ^ head changed (expected prefix {stable:?})");
                 }
@@ -1391,52 +1380,37 @@ mod silence_tests {
     }
 
     #[test]
-    fn cut_lands_in_the_silent_gap_not_in_speech() {
-        // speech 0-1 s, gap 1.0-1.4 s, speech 1.4-2.4 s
-        let a = signal(&[(1.0, true), (0.4, false), (1.0, true)]);
-        let cut = find_silent_cut(&a, 0.9, 1.5).expect("gap");
-        assert!(cut > 1.0 && cut < 1.4, "cut = {cut}");
+    fn a_pause_at_the_end_is_found_with_its_start_time() {
+        // speech 0-1.5 s, then 1 s of silence
+        let a = signal(&[(1.5, true), (1.0, false)]);
+        let start = trailing_silence_start(&a, 0.6).expect("pause");
+        assert!((1.4..=1.6).contains(&start), "start = {start}");
     }
 
     #[test]
-    fn no_gap_means_no_cut() {
-        let a = signal(&[(3.0, true)]);
-        assert_eq!(find_silent_cut(&a, 0.5, 2.5), None);
+    fn no_pause_while_speech_continues_to_the_end() {
+        let a = signal(&[(0.5, false), (2.0, true)]);
+        assert_eq!(trailing_silence_start(&a, 0.6), None);
     }
 
     #[test]
-    fn gaps_outside_the_allowed_range_are_ignored() {
-        let a = signal(&[(1.0, true), (0.4, false), (3.0, true)]);
-        assert_eq!(find_silent_cut(&a, 2.0, 3.0), None);
+    fn a_too_short_pause_is_not_a_pause() {
+        let a = signal(&[(1.5, true), (0.3, false)]);
+        assert_eq!(trailing_silence_start(&a, 0.6), None);
+        assert_eq!(trailing_silence_start(&[], 0.6), None);
     }
 
     #[test]
-    fn too_short_a_pause_is_not_a_gap() {
-        let a = signal(&[(1.0, true), (0.04, false), (1.0, true)]);
-        assert_eq!(find_silent_cut(&a, 0.8, 1.3), None);
+    fn a_silence_in_the_middle_is_ignored() {
+        let a = signal(&[(1.0, true), (1.0, false), (1.0, true)]);
+        assert_eq!(trailing_silence_start(&a, 0.6), None);
     }
 
     #[test]
-    fn a_100ms_dip_inside_a_word_is_not_a_cut_point() {
-        // stop consonants leave ~100 ms near-silences inside words
-        let a = signal(&[(1.0, true), (0.1, false), (1.0, true)]);
-        assert_eq!(find_silent_cut(&a, 0.8, 1.3), None);
-        // a real pause of 150 ms is
-        let b = signal(&[(1.0, true), (0.15, false), (1.0, true)]);
-        assert!(find_silent_cut(&b, 0.8, 1.3).is_some());
-    }
-
-    #[test]
-    fn closest_gap_to_the_target_is_chosen() {
-        let a = signal(&[
-            (1.0, true),
-            (0.3, false),
-            (1.0, true),
-            (0.3, false),
-            (1.0, true),
-        ]);
-        let cut = find_silent_cut(&a, 2.0, 2.6).expect("gap");
-        assert!(cut > 2.3 && cut < 2.6, "cut = {cut}");
+    fn all_silent_audio_reports_a_pause_from_the_start() {
+        let a = signal(&[(1.5, false)]);
+        let start = trailing_silence_start(&a, 0.6).expect("pause");
+        assert!(start < 0.05, "start = {start}");
     }
 
     #[test]

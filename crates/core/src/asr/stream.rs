@@ -1,8 +1,15 @@
 //! Turns a stream of repeated whole-window hypotheses into stable, growing
-//! captions (YouTube style): words that stay the same across two consecutive
-//! passes are *committed* and never change again; only the last few words (the
-//! tentative tail) may be revised. This is the "local agreement" strategy from
-//! streaming Whisper implementations.
+//! captions (YouTube style).
+//!
+//! * Words become **frozen** once they are stable: either two consecutive passes
+//!   agree on them and they are at least [`AGREE_MIN_AGE`] old, or they are older
+//!   than [`FREEZE_AGE`] (Whisper practically never revises text that far back).
+//!   Frozen words never change again; only the short tail after them is tentative.
+//! * Freezing is independent of trimming the audio. Audio is cut (so it is not
+//!   transcribed again) only during a real pause at the *end* of the buffer, when
+//!   every word is complete. Whisper's word timestamps are too inaccurate to tell
+//!   which words lie before a cut in the middle of speech, and a word whose audio
+//!   is cut before it was frozen is simply lost.
 //!
 //! Pure logic, no Whisper dependency, so it is unit-testable.
 
@@ -25,15 +32,23 @@ impl Word {
     }
 }
 
-/// Most committed words kept for display (older ones scroll off anyway).
+/// Most frozen words kept for display (older ones scroll off anyway).
 const MAX_COMMITTED_WORDS: usize = 80;
-/// If the window grows past this without any agreement, commit most of it.
-const FORCE_COMMIT_SECS: f32 = 12.0;
-/// Words left tentative when force-committing.
-const FORCE_KEEP_WORDS: usize = 3;
-/// If no silent gap to cut at ever turns up (continuous speech), accept a hard
-/// cut at the word boundary once the window is this long.
-const HARD_CUT_SECS: f32 = 16.0;
+/// A word two passes agree on must also be this old (seconds before the end of
+/// the audio) before it freezes: a wrong guess can repeat for a pass or two.
+const AGREE_MIN_AGE: f32 = 1.0;
+/// Words older than this freeze regardless of agreement.
+const FREEZE_AGE: f32 = 2.5;
+/// A pause at the end of the audio must last this long before everything is
+/// frozen and the audio is cut.
+pub const PAUSE_SECS: f32 = 0.6;
+/// If speech never pauses, accept a hard cut at the end of the frozen words once
+/// the window is this long.
+const HARD_CUT_SECS: f32 = 12.0;
+/// A hard cut is taken this much *before* the end of the last frozen word: a
+/// leftover sliver of it is dropped by the repeat check, whereas cutting too late
+/// would clip the next word.
+const HARD_CUT_BACKOFF: f32 = 0.2;
 
 /// CJK scripts have no spaces between words.
 pub fn is_cjk(c: char) -> bool {
@@ -97,27 +112,25 @@ pub fn sanitize_times(words: &mut [Word], audio_secs: f32) {
 /// Result of feeding one hypothesis.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Update {
-    /// Everything to show: committed words followed by the tentative tail.
+    /// Everything to show: frozen words followed by the tentative tail.
     pub display: String,
-    /// Drop this many seconds from the start of the audio window (it has been
-    /// committed and will not be transcribed again).
+    /// Drop this many seconds from the start of the audio window (it holds only
+    /// frozen words and will not be transcribed again).
     pub cut_secs: Option<f32>,
 }
 
 #[derive(Default)]
 pub struct StreamState {
     committed: Vec<String>,
-    /// Previous hypothesis, re-based to the current window.
+    /// End (window-relative seconds) of the last frozen word; `0` if none in this window.
+    frozen_end: f32,
+    /// Previous tentative hypothesis, in current-window coordinates.
     prev: Vec<Word>,
     spaceless: bool,
-    /// The last committed word did not end a sentence, so the next window's
-    /// first word must not keep the capital letter Whisper gives every window start.
+    /// The last frozen word did not end a sentence, so the next window's first
+    /// word must not keep the capital letter Whisper gives every window start.
     lower_first: bool,
 }
-
-/// A word starting within this many seconds of the window start can be the
-/// remainder of the word that was just committed.
-const REMNANT_WINDOW_SECS: f32 = 0.3;
 
 fn ends_sentence(word: &str) -> bool {
     word.trim_end().chars().next_back().is_some_and(|c| {
@@ -160,6 +173,7 @@ impl StreamState {
     pub fn reset(&mut self) {
         self.committed.clear();
         self.prev.clear();
+        self.frozen_end = 0.0;
         self.spaceless = false;
         self.lower_first = false;
     }
@@ -187,82 +201,111 @@ impl StreamState {
         out
     }
 
+    /// Words at the start of `hyp` that repeat the last frozen words (the audio
+    /// kept after a cut can still hold a sliver of them, and timestamps differ a
+    /// little between passes).
+    fn repeated_prefix(&self, hyp: &[Word]) -> usize {
+        for k in (1..=3).rev() {
+            if hyp.len() >= k
+                && self.committed.len() >= k
+                && hyp[..k]
+                    .iter()
+                    .zip(&self.committed[self.committed.len() - k..])
+                    .all(|(h, c)| {
+                        let n = norm(&h.text);
+                        !n.is_empty() && n == norm(c)
+                    })
+            {
+                return k;
+            }
+        }
+        0
+    }
+
     /// Feed the latest hypothesis for the current audio window (`audio_secs` long).
     ///
-    /// Committing drops the committed audio, and Whisper's word timestamps are
-    /// only approximate, so a cut must not land inside a word. `snap(lo, hi)`
-    /// must return a time within `lo..=hi` that lies in a silent gap of the real
-    /// audio, or `None` if there is none; with `None` the words simply stay
-    /// tentative for now.
+    /// `trailing_silence` is where (window-relative seconds) the silence at the
+    /// very end of the audio began, if there is one of at least [`PAUSE_SECS`].
+    /// The speaker has stopped, so every word is complete: they are all frozen and
+    /// the audio is cut inside the silence. Otherwise the audio is kept (frozen
+    /// words stay frozen either way).
     pub fn update(
         &mut self,
         mut hyp: Vec<Word>,
         audio_secs: f32,
-        snap: &dyn Fn(f32, f32) -> Option<f32>,
+        trailing_silence: Option<f32>,
     ) -> Update {
         hyp.retain(|w| !w.text.trim().is_empty());
         self.spaceless = hyp.iter().any(|w| w.text.chars().any(is_cjk));
         sanitize_times(&mut hyp, audio_secs);
 
-        // The audio left after a cut can still contain the tail of the word that
-        // was just committed; drop it instead of showing it twice.
-        if let (Some(last), Some(first)) = (self.committed.last(), hyp.first()) {
-            if first.t0 < REMNANT_WINDOW_SECS
-                && !norm(&first.text).is_empty()
-                && norm(&first.text) == norm(last)
-            {
-                hyp.remove(0);
-            }
+        // Words that are already frozen are not shown again.
+        if self.frozen_end > 0.0 {
+            let end = self.frozen_end;
+            // A word that ends where the frozen text ends (or earlier) is a repeat.
+            hyp.retain(|w| (w.t0 + w.t1) / 2.0 > end - 0.1 && w.t1 > end + 0.02);
         }
+        let repeated = self.repeated_prefix(&hyp);
+        hyp.drain(..repeated);
+
         if self.lower_first && !self.spaceless {
             if let Some(first) = hyp.first_mut() {
                 first.text = lowercase_first(&first.text);
             }
         }
 
-        let mut agreed = common_prefix_len(&self.prev, &hyp);
-        if agreed == 0 && audio_secs > FORCE_COMMIT_SECS && hyp.len() > FORCE_KEEP_WORDS {
-            agreed = hyp.len() - FORCE_KEEP_WORDS;
+        // Freeze the stable prefix.
+        let agreed = common_prefix_len(&self.prev, &hyp);
+        let mut freeze = 0;
+        for (i, w) in hyp.iter().enumerate() {
+            let age = audio_secs - w.t1;
+            let stable = (i < agreed && age >= AGREE_MIN_AGE) || age >= FREEZE_AGE;
+            if !stable {
+                break;
+            }
+            freeze = i + 1;
+        }
+        if freeze > 0 {
+            self.committed
+                .extend(hyp[..freeze].iter().map(|w| w.text.clone()));
+            let excess = self.committed.len().saturating_sub(MAX_COMMITTED_WORDS);
+            self.committed.drain(..excess);
+            self.lower_first = self.committed.last().is_some_and(|w| !ends_sentence(w));
+            self.frozen_end = hyp[freeze - 1].t1;
+            hyp.drain(..freeze);
         }
 
+        // A pause at the end: the speaker stopped, so nothing in `hyp` is still
+        // being said. Freeze it all and cut inside the silence.
         let mut cut_secs = None;
-        let mut committed_now = false;
-        if agreed > 0 {
-            let end = hyp[agreed - 1].t1;
-            // The cut belongs in the gap between the last agreed word and the next one.
-            let (lo, hi) = match hyp.get(agreed) {
-                Some(next) => (end - 0.1, (next.t0 + 0.25).max(end)),
-                None => (end - 0.1, end + 0.6),
-            };
-            let (lo, hi) = (lo.max(0.0), hi.min((audio_secs - 0.2).max(0.0)));
-            let mut cut = if hi >= lo { snap(lo, hi) } else { None };
-            if cut.is_none() && audio_secs > HARD_CUT_SECS {
-                cut = Some(end.clamp(0.0, (audio_secs - 0.2).max(0.0)));
-            }
-            if let Some(cut) = cut {
-                self.committed
-                    .extend(hyp[..agreed].iter().map(|w| w.text.clone()));
-                self.lower_first = self.committed.last().is_some_and(|w| !ends_sentence(w));
+        let limit = (audio_secs - 0.2).max(0.0);
+        if let Some(start) = trailing_silence.filter(|s| audio_secs - s >= PAUSE_SECS) {
+            if !hyp.is_empty() {
+                self.committed.extend(hyp.iter().map(|w| w.text.clone()));
                 let excess = self.committed.len().saturating_sub(MAX_COMMITTED_WORDS);
                 self.committed.drain(..excess);
-                if cut > 0.0 {
-                    cut_secs = Some(cut);
+                self.lower_first = self.committed.last().is_some_and(|w| !ends_sentence(w));
+                hyp.clear();
+            }
+            let cut = (start + 0.3).min(limit);
+            if cut > 0.0 {
+                cut_secs = Some(cut);
+                self.frozen_end = 0.0;
+            }
+        } else if audio_secs > HARD_CUT_SECS && self.frozen_end > 0.0 {
+            // Continuous speech for a long time: cut at the end of the frozen words.
+            let cut = (self.frozen_end - HARD_CUT_BACKOFF).clamp(0.0, limit);
+            if cut > 0.0 {
+                cut_secs = Some(cut);
+                self.frozen_end = (self.frozen_end - cut).max(0.0);
+                for w in &mut hyp {
+                    w.t0 = (w.t0 - cut).max(0.0);
+                    w.t1 = (w.t1 - cut).max(0.0);
                 }
-                self.prev = hyp[agreed..]
-                    .iter()
-                    .map(|w| Word {
-                        text: w.text.clone(),
-                        t0: (w.t0 - cut).max(0.0),
-                        t1: (w.t1 - cut).max(0.0),
-                    })
-                    .collect();
-                committed_now = true;
             }
         }
-        if !committed_now {
-            self.prev = hyp;
-        }
 
+        self.prev = hyp;
         let display = self.join(
             self.committed
                 .iter()
@@ -287,98 +330,188 @@ impl StreamState {
 mod tests {
     use super::*;
 
-    /// Snap that always finds a gap in the middle of the allowed range.
-    fn mid(lo: f32, hi: f32) -> Option<f32> {
-        Some((lo + hi) / 2.0)
-    }
+    /// No pause at the end of the audio (the speaker is still talking).
+    const TALKING: Option<f32> = None;
 
-    fn words(text: &str) -> Vec<Word> {
+    /// Words spaced 0.4 s apart starting at `start`.
+    fn words_at(text: &str, start: f32) -> Vec<Word> {
         text.split_whitespace()
             .enumerate()
-            .map(|(i, w)| Word::new(w, i as f32 * 0.4, i as f32 * 0.4 + 0.35))
+            .map(|(i, w)| {
+                let t = start + i as f32 * 0.4;
+                Word::new(w, t, t + 0.35)
+            })
             .collect()
     }
 
+    fn words(text: &str) -> Vec<Word> {
+        words_at(text, 0.0)
+    }
+
     #[test]
-    fn first_hypothesis_is_shown_but_nothing_is_committed_yet() {
+    fn young_words_are_shown_but_not_frozen() {
         let mut s = StreamState::new();
-        let u = s.update(words("hello this is"), 1.4, &mid);
+        let u = s.update(words("hello this is"), 1.5, TALKING);
         assert_eq!(u.display, "hello this is");
+        assert_eq!(u.cut_secs, None);
+        assert!(s.committed.is_empty());
+        // agreement alone is not enough while the words are young
+        let u = s.update(words("hello this is a"), 1.25, TALKING);
+        assert_eq!(u.display, "hello this is a");
+        assert!(s.committed.is_empty(), "{:?}", s.committed);
+    }
+
+    #[test]
+    fn agreeing_old_enough_words_freeze_but_the_audio_is_not_cut_mid_speech() {
+        let mut s = StreamState::new();
+        s.update(words("hello this is a test"), 2.2, TALKING);
+        let u = s.update(words("hello this is a test of it"), 2.8, TALKING);
+        // words that ended more than 1 s ago and were agreed on are frozen...
+        assert!(s.committed.len() >= 2, "{:?}", s.committed);
+        assert_eq!(u.display, "hello this is a test of it");
+        // ...but cutting mid-speech could lose a word, so the audio is kept
+        assert_eq!(u.cut_secs, None);
+    }
+
+    #[test]
+    fn frozen_words_never_change_even_if_later_passes_disagree() {
+        let mut s = StreamState::new();
+        s.update(words("hello this is a test"), 2.2, TALKING);
+        s.update(words("hello this is a test of it"), 2.8, TALKING);
+        let frozen = s.committed.clone();
+        assert!(!frozen.is_empty());
+        // a later pass rewrites the early words completely: the display must not follow
+        let u = s.update(words("jello miss was the best of it again"), 3.4, TALKING);
+        assert!(
+            u.display.starts_with(&frozen.join(" ")),
+            "frozen head changed: {:?} vs {frozen:?}",
+            u.display
+        );
+    }
+
+    #[test]
+    fn words_older_than_the_freeze_age_freeze_without_agreement() {
+        let mut s = StreamState::new();
+        // first ever hypothesis: nothing to agree with, but the early words are old
+        let u = s.update(
+            words("one two three four five six seven eight"),
+            4.0,
+            TALKING,
+        );
+        assert!(!s.committed.is_empty(), "old words must freeze");
+        assert!(u.display.starts_with("one two"));
+    }
+
+    #[test]
+    fn freezing_works_without_any_silent_gap_to_cut_at() {
+        // continuous speech: the audio is never cut, yet the head stays put
+        let mut s = StreamState::new();
+        let mut shown: Vec<String> = Vec::new();
+        for step in 0..12 {
+            let secs = 2.0 + step as f32 * 0.5;
+            let n = ((secs / 0.4) as usize).min(20);
+            let text = (1..=n)
+                .map(|i| format!("w{i}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let u = s.update(words(&text), secs, TALKING);
+            assert_eq!(u.cut_secs, None);
+            shown.push(u.display);
+        }
+        for pair in shown.windows(2) {
+            let head = pair[0]
+                .split_whitespace()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                pair[1].starts_with(&head),
+                "head moved: {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_pause_freezes_every_word_and_cuts_inside_the_silence() {
+        let mut s = StreamState::new();
+        // speech until ~2.0 s, then the speaker stops; audio is now 3.2 s long
+        s.update(words("alpha beta gamma delta"), 1.9, TALKING);
+        let u = s.update(words("alpha beta gamma delta"), 3.2, Some(2.0));
+        assert_eq!(u.display, "alpha beta gamma delta");
+        assert_eq!(s.committed.len(), 4, "everything is final after a pause");
+        let cut = u.cut_secs.expect("cut during the pause");
+        assert!(
+            cut > 2.0 && cut < 3.1,
+            "cut must lie inside the silence: {cut}"
+        );
+        // the next utterance starts from a clean window and appends
+        let u = s.update(words("epsilon zeta"), 1.0, TALKING);
+        assert_eq!(u.display, "alpha beta gamma delta epsilon zeta");
+    }
+
+    #[test]
+    fn a_pause_that_is_too_short_changes_nothing() {
+        let mut s = StreamState::new();
+        let u = s.update(words("alpha beta"), 1.5, Some(1.2)); // only 0.3 s of silence
         assert_eq!(u.cut_secs, None);
         assert!(s.committed.is_empty());
     }
 
     #[test]
-    fn agreeing_prefix_is_committed_and_audio_is_cut() {
+    fn a_pause_with_nothing_new_still_cuts_the_leftover_audio() {
         let mut s = StreamState::new();
-        s.update(words("hello this is"), 1.4, &mid);
-        let u = s.update(words("hello this is a test"), 2.0, &mid);
-        assert_eq!(u.display, "hello this is a test");
-        // "hello this is" agreed: cut between "is" and "a"
-        let cut = u.cut_secs.expect("cut");
-        assert!((1.05..=1.45).contains(&cut), "cut = {cut}");
-        assert_eq!(s.committed, ["hello", "this", "is"]);
-        // remaining tentative words were re-based to the cut point
-        assert!(s.prev[0].t0 < 0.2, "{:?}", s.prev);
+        s.update(words("alpha beta gamma delta"), 1.9, TALKING);
+        s.update(words("alpha beta gamma delta"), 3.2, Some(2.0));
+        // the window was cut but silence keeps arriving: an empty hypothesis cuts again
+        let u = s.update(vec![], 1.5, Some(0.0));
+        assert_eq!(u.display, "alpha beta gamma delta");
     }
 
     #[test]
-    fn committed_words_never_change_even_if_later_passes_disagree() {
+    fn continuous_speech_is_cut_only_when_the_window_gets_very_long() {
         let mut s = StreamState::new();
-        s.update(words("hello this is"), 1.4, &mid);
-        s.update(words("hello this is a test"), 2.0, &mid);
-        // After the cut the window starts at "a": a wild later guess changes only the tail.
-        let u = s.update(words("a text of live"), 1.5, &mid);
-        assert!(u.display.starts_with("hello this is a"), "{}", u.display);
-        let u2 = s.update(words("a test of live"), 1.9, &mid);
-        assert!(u2.display.starts_with("hello this is a"), "{}", u2.display);
+        let text = (1..=12)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(s.update(words(&text), 5.0, TALKING).cut_secs, None);
+        let mut s = StreamState::new();
+        let long = (1..=40)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let u = s.update(words(&long), 16.5, TALKING);
+        let cut = u.cut_secs.expect("a very long window is cut");
+        // backed off from the end of the last frozen word, not past it
+        assert!(cut > 0.0 && cut < 16.5 - 2.0, "cut = {cut}");
     }
 
     #[test]
-    fn display_only_ever_appends_in_the_committed_part() {
-        // Simulate a flickery recogniser: the tail wobbles, the head must be stable.
-        let hyps = [
-            "to jest",
-            "to jest test",
-            "to jest tekst napisów",
-            "to jest test napisów na",
-            "to jest test napisów na żywo",
-            "to jest test napisów na żywo dzisiaj",
+    fn a_repeat_of_the_last_frozen_word_after_a_cut_is_dropped() {
+        let mut s = StreamState::new();
+        s.update(words("mówię powoli żeby sprawdzić czy"), 2.0, TALKING);
+        // the speaker pauses: everything is frozen and the audio is cut
+        let u = s.update(words("mówię powoli żeby sprawdzić czy"), 3.4, Some(2.1));
+        assert!(u.cut_secs.is_some());
+        let last = s.committed.last().cloned().unwrap();
+        // the next window starts with a sliver of the last frozen word again
+        let again = vec![
+            Word::new(&last, 0.0, 0.1),
+            Word::new("podpisy", 0.3, 0.8),
+            Word::new("są", 0.9, 1.2),
         ];
-        let mut s = StreamState::new();
-        let mut shown: Vec<String> = vec![];
-        let mut window_words: Vec<String> = vec![];
-        for (i, h) in hyps.iter().enumerate() {
-            let mut hyp = words(h);
-            // emulate the caller cutting committed audio: later hypotheses only contain new words
-            if !window_words.is_empty() {
-                hyp = words(
-                    &h.split_whitespace()
-                        .skip(window_words.len())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                );
-            }
-            let u = s.update(hyp, 0.4 * (i as f32 + 2.0), &mid);
-            if u.cut_secs.is_some() {
-                window_words = s.committed.clone();
-            }
-            shown.push(u.display);
-        }
-        let last = shown.last().unwrap();
-        assert!(last.starts_with("to jest"), "{last}");
-        // once "to jest" was committed it is a prefix of everything after
-        let first_committed = shown
-            .iter()
-            .position(|d| s_committed_prefix(d, "to jest"))
-            .unwrap();
-        assert!(shown[first_committed..]
-            .iter()
-            .all(|d| d.starts_with("to jest")));
+        let u = s.update(again, 1.4, TALKING);
+        assert_eq!(u.display.matches(last.as_str()).count(), 1, "{}", u.display);
+        assert!(u.display.contains("są"), "{}", u.display);
     }
 
-    fn s_committed_prefix(d: &str, p: &str) -> bool {
-        d.starts_with(p)
+    #[test]
+    fn a_genuinely_repeated_word_in_the_first_window_is_kept() {
+        let mut s = StreamState::new();
+        let u = s.update(words("no no way no"), 1.6, TALKING);
+        assert_eq!(u.display, "no no way no");
     }
 
     #[test]
@@ -386,176 +519,75 @@ mod tests {
         let mut s = StreamState::new();
         s.update(
             vec![Word::new("Hello,", 0.0, 0.4), Word::new("world", 0.5, 0.9)],
-            1.0,
-            &mid,
+            2.5,
+            TALKING,
         );
-        let u = s.update(
+        s.update(
             vec![
                 Word::new("hello", 0.0, 0.4),
                 Word::new("world.", 0.5, 0.9),
                 Word::new("again", 1.0, 1.4),
             ],
-            1.5,
-            &mid,
+            2.6,
+            TALKING,
         );
-        assert!(u.cut_secs.is_some());
-        assert_eq!(s.committed.len(), 2);
-    }
-
-    #[test]
-    fn forces_a_commit_when_the_window_gets_too_long() {
-        let mut s = StreamState::new();
-        let long = words("one two three four five six seven eight");
-        s.update(words("zzz"), 1.0, &mid); // prev that never agrees
-        let u = s.update(long, 13.0, &mid);
-        assert!(u.cut_secs.is_some());
-        assert_eq!(s.committed.len(), 5); // all but the last 3
-        assert_eq!(u.display, "one two three four five six seven eight");
-    }
-
-    #[test]
-    fn without_a_silent_gap_nothing_is_committed_or_cut() {
-        let mut s = StreamState::new();
-        let no_gap = |_: f32, _: f32| None;
-        s.update(words("hello this is"), 1.4, &no_gap);
-        let u = s.update(words("hello this is a test"), 2.0, &no_gap);
-        assert_eq!(u.display, "hello this is a test");
-        assert_eq!(u.cut_secs, None, "must not cut inside speech");
-        assert!(s.committed.is_empty());
-        // ...and everything is still shown, so the display keeps growing
-        let u = s.update(words("hello this is a test of it"), 2.8, &no_gap);
-        assert_eq!(u.display, "hello this is a test of it");
-    }
-
-    #[test]
-    fn the_cut_is_requested_between_the_agreed_word_and_the_next() {
-        let mut s = StreamState::new();
-        let asked = std::cell::Cell::new((0.0f32, 0.0f32));
-        let probe = |lo: f32, hi: f32| {
-            asked.set((lo, hi));
-            Some((lo + hi) / 2.0)
-        };
-        s.update(words("hello this is"), 1.4, &probe);
-        s.update(words("hello this is a test"), 2.0, &probe);
-        let (lo, hi) = asked.get();
-        // "is" ends at 1.15, "a" starts at 1.2
-        assert!(lo < 1.15 && lo > 1.0, "lo = {lo}");
-        assert!((1.2..1.6).contains(&hi), "hi = {hi}");
-    }
-
-    #[test]
-    fn a_hard_cut_is_taken_only_for_very_long_windows() {
-        let mut s = StreamState::new();
-        let no_gap = |_: f32, _: f32| None;
-        s.update(words("a b c d"), 10.0, &no_gap);
-        assert_eq!(s.update(words("a b c d e"), 10.5, &no_gap).cut_secs, None);
-        let mut s = StreamState::new();
-        s.update(words("a b c d"), 16.5, &no_gap);
-        assert!(s
-            .update(words("a b c d e"), 17.0, &no_gap)
-            .cut_secs
-            .is_some());
-    }
-
-    #[test]
-    fn a_remnant_of_the_committed_word_is_not_shown_twice() {
-        let mut s = StreamState::new();
-        s.update(words("mówię powoli żeby"), 1.6, &mid);
-        let u = s.update(words("mówię powoli żeby sprawdzić"), 2.0, &mid);
-        assert!(s.committed.len() >= 3, "{:?}", s.committed);
-        // next window starts with a sliver of the last committed word again
-        let again = vec![
-            Word::new("żeby", 0.0, 0.1),
-            Word::new("sprawdzić", 0.25, 0.7),
-        ];
-        let u2 = s.update(again, 0.9, &mid);
-        assert_eq!(u2.display.matches("żeby").count(), 1, "{}", u2.display);
-        assert!(u2.display.contains("sprawdzić"));
-        let _ = u;
-    }
-
-    #[test]
-    fn a_genuinely_repeated_word_later_in_the_window_is_kept() {
-        let mut s = StreamState::new();
-        s.update(words("no no"), 1.0, &mid);
-        s.update(words("no no way"), 1.5, &mid);
-        let u = s.update(
-            vec![Word::new("no", 1.0, 1.3), Word::new("way", 1.4, 1.8)],
-            2.0,
-            &mid,
-        );
-        assert_eq!(u.display.matches("no").count(), 3, "{}", u.display);
+        assert_eq!(s.committed.len(), 2, "{:?}", s.committed);
     }
 
     #[test]
     fn mid_sentence_window_starts_are_not_capitalised() {
         let mut s = StreamState::new();
-        s.update(words("pogoda i świeci"), 1.5, &mid);
-        s.update(words("pogoda i świeci słońce"), 2.0, &mid);
+        s.update(words("pogoda i świeci słońce dziś"), 3.0, TALKING);
+        s.update(words("pogoda i świeci słońce dziś jest"), 3.4, TALKING);
+        assert!(!s.committed.is_empty());
         let u = s.update(
-            vec![Word::new("Słońce.", 0.1, 0.6), Word::new("Mówię", 0.8, 1.2)],
-            1.3,
-            &mid,
+            vec![Word::new("Słońce", 0.1, 0.5), Word::new("dziś", 0.6, 0.9)],
+            1.0,
+            TALKING,
         );
-        assert!(u.display.contains("słońce."), "{}", u.display);
+        assert!(!u.display.contains("Słońce"), "{}", u.display);
     }
 
     #[test]
     fn sentence_starts_keep_their_capital() {
         let mut s = StreamState::new();
-        s.update(words("to jest test."), 1.2, &mid);
-        s.update(words("to jest test. Dzisiaj"), 1.6, &mid);
+        s.update(words("to jest test. Dzisiaj"), 3.0, TALKING);
+        s.update(words("to jest test. Dzisiaj jest"), 3.4, TALKING);
         let u = s.update(
             vec![Word::new("Dzisiaj", 0.1, 0.5), Word::new("jest", 0.6, 0.9)],
             1.0,
-            &mid,
+            TALKING,
         );
         assert!(u.display.contains("Dzisiaj"), "{}", u.display);
     }
 
     #[test]
-    fn acronyms_and_names_helpers() {
-        assert_eq!(lowercase_first("Słońce."), "słońce.");
-        assert_eq!(lowercase_first("NASA"), "NASA");
-        assert_eq!(lowercase_first("I"), "I");
-        assert!(ends_sentence("test."));
-        assert!(ends_sentence("co?"));
-        assert!(!ends_sentence("test,"));
-        assert!(!ends_sentence("test"));
-    }
-
-    #[test]
     fn a_finished_sentence_starts_the_next_line() {
         let mut s = StreamState::new();
-        let u = s.update(words("to jest test. Dzisiaj jest ładnie"), 3.0, &mid);
+        let u = s.update(words("to jest test. Dzisiaj jest ładnie"), 3.0, TALKING);
         assert_eq!(u.display, "to jest test.\nDzisiaj jest ładnie");
     }
 
     #[test]
     fn abbreviations_and_numbers_do_not_break_the_line() {
         let mut s = StreamState::new();
-        let u = s.update(words("pan dr. Kowalski kupił 3. książkę"), 3.0, &mid);
+        let u = s.update(words("pan dr. Kowalski kupił 3. książkę"), 3.0, TALKING);
         assert_eq!(u.display, "pan dr. Kowalski kupił 3. książkę");
     }
 
     #[test]
     fn questions_and_exclamations_also_end_a_line() {
         let mut s = StreamState::new();
-        let u = s.update(words("co robisz? nic! dobrze"), 2.0, &mid);
+        let u = s.update(words("co robisz? nic! dobrze"), 2.0, TALKING);
         assert_eq!(u.display, "co robisz?\nnic!\ndobrze");
     }
 
     #[test]
-    fn line_breaks_survive_commits_and_never_double_up() {
+    fn line_breaks_never_double_up_across_commits() {
         let mut s = StreamState::new();
-        s.update(words("to jest test. Dzisiaj"), 2.0, &mid);
-        // agreement commits "to jest test. Dzisiaj" and cuts the audio
-        s.update(words("to jest test. Dzisiaj jest"), 2.4, &mid);
-        assert_eq!(s.committed.len(), 4);
-        // ...so the next window only contains the words after the cut
-        let u = s.update(words("jest ładnie"), 1.0, &mid);
-        assert_eq!(u.display, "to jest test.\nDzisiaj jest ładnie");
-        assert_eq!(u.display.matches('\n').count(), 1);
+        s.update(words("to jest test. Dzisiaj jest"), 3.0, TALKING);
+        let u = s.update(words("to jest test. Dzisiaj jest ładnie"), 3.4, TALKING);
+        assert_eq!(u.display.matches('\n').count(), 1, "{:?}", u.display);
     }
 
     #[test]
@@ -564,7 +596,7 @@ mod tests {
         let u = s.update(
             vec![Word::new("字幕。", 0.0, 0.5), Word::new("テスト", 0.5, 1.0)],
             1.0,
-            &mid,
+            TALKING,
         );
         assert_eq!(u.display, "字幕。\nテスト");
     }
@@ -580,7 +612,6 @@ mod tests {
         assert!((w[0].t1 - 1.0).abs() < 1e-4);
         assert!((w[1].t0 - 1.0).abs() < 1e-4 && (w[1].t1 - 3.0).abs() < 1e-4);
         assert!((w[2].t1 - 4.0).abs() < 1e-4);
-        // good timestamps are left alone
         let mut good = words("a b c");
         let before = good.clone();
         sanitize_times(&mut good, 2.0);
@@ -588,33 +619,25 @@ mod tests {
     }
 
     #[test]
-    fn spaceless_scripts_join_without_spaces() {
-        let mut s = StreamState::new();
-        let u = s.update(
-            vec![Word::new("字幕", 0.0, 0.5), Word::new("テスト", 0.5, 1.0)],
-            1.0,
-            &mid,
-        );
-        assert_eq!(u.display, "字幕テスト");
-    }
-
-    #[test]
     fn reset_starts_a_new_utterance() {
         let mut s = StreamState::new();
-        s.update(words("hello there"), 1.0, &mid);
-        s.update(words("hello there friend"), 1.5, &mid);
+        s.update(words("hello there friend"), 1.5, TALKING);
         assert!(!s.is_empty());
         s.reset();
         assert!(s.is_empty());
-        assert_eq!(s.update(words("new start"), 1.0, &mid).display, "new start");
+        assert_eq!(
+            s.update(words("new start"), 1.0, TALKING).display,
+            "new start"
+        );
     }
 
     #[test]
     fn empty_and_blank_hypotheses_are_harmless() {
         let mut s = StreamState::new();
-        assert_eq!(s.update(vec![], 1.0, &mid).display, "");
+        assert_eq!(s.update(vec![], 1.0, TALKING).display, "");
         assert_eq!(
-            s.update(vec![Word::new("  ", 0.0, 0.1)], 1.0, &mid).display,
+            s.update(vec![Word::new("  ", 0.0, 0.1)], 1.0, TALKING)
+                .display,
             ""
         );
     }
@@ -624,5 +647,134 @@ mod tests {
         assert_eq!(StreamState::tail_words("a b c d e f", 3), "d e f");
         assert_eq!(StreamState::tail_words("short one", 10), "short one");
         assert_eq!(StreamState::tail_words("", 3), "");
+    }
+
+    // ---------------------------------------------------------------- simulation
+
+    /// Deterministic pseudo-random numbers in 0..1.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as f32) / (u32::MAX >> 1) as f32
+        }
+    }
+
+    /// A noisy recogniser: every pass hears the truth, except that words within
+    /// the last 2 s are often wrong and words 2-3.5 s back are occasionally wrong.
+    /// The speaker pauses for 1.5 s after `pause_after` words (if given).
+    /// Returns violations of two properties: text older than ~2.6 s on screen never
+    /// changes, and no spoken word is ever lost.
+    fn simulate(pause_after: Option<usize>, seed: u64) -> Vec<String> {
+        let truth: Vec<String> = (1..=45).map(|i| format!("slowo{i}")).collect();
+        let word_secs = 0.35;
+        let pause = 1.5f32;
+        // absolute start/end of word i (a pause is inserted after `pause_after` words)
+        let times = |i: usize| -> (f32, f32) {
+            let shift = match pause_after {
+                Some(n) if i >= n => pause,
+                _ => 0.0,
+            };
+            let t0 = i as f32 * word_secs + shift;
+            (t0, t0 + 0.3)
+        };
+        let mut rng = Lcg(seed);
+        let mut state = StreamState::new();
+        let mut window_start = 0.0f32; // absolute time where the audio window starts
+        let mut shown: Vec<(f32, String)> = Vec::new();
+
+        let mut now = 1.0f32;
+        while now < 22.0 {
+            let spoken: Vec<usize> = (0..truth.len()).filter(|i| times(*i).1 <= now).collect();
+            let hyp: Vec<Word> = spoken
+                .iter()
+                .filter(|i| (times(**i).0 + times(**i).1) / 2.0 > window_start)
+                .map(|i| {
+                    let (t0, t1) = times(*i);
+                    let age = now - t1;
+                    let wrong = (age < 2.0 && rng.next() < 0.45)
+                        || ((2.0..3.5).contains(&age) && rng.next() < 0.08);
+                    let text = if wrong {
+                        format!("zle{}", (rng.next() * 100.0) as u32)
+                    } else {
+                        truth[*i].clone()
+                    };
+                    Word::new(
+                        &text,
+                        (t0 - window_start).max(0.0),
+                        (t1 - window_start).max(0.0),
+                    )
+                })
+                .collect();
+            // silence at the end of the audio, if the last spoken word ended a while ago
+            let last_end = spoken.last().map(|i| times(*i).1).unwrap_or(0.0);
+            let trailing =
+                (now - last_end >= PAUSE_SECS).then_some((last_end - window_start).max(0.0));
+            let audio_secs = now - window_start;
+            let u = state.update(hyp, audio_secs, trailing);
+            if let Some(cut) = u.cut_secs {
+                window_start += cut;
+            }
+            shown.push((now, u.display));
+            now += 0.4;
+        }
+
+        let mut violations = Vec::new();
+        // 1. old text never changes
+        for pair in shown.windows(2) {
+            let (t, ref prev) = pair[0];
+            let (_, ref cur) = pair[1];
+            let words_prev: Vec<&str> = prev.split_whitespace().collect();
+            let stable = words_prev
+                .len()
+                .saturating_sub((2.6 / word_secs) as usize + 1);
+            let head = words_prev[..stable].join(" ");
+            if !cur.starts_with(&head) {
+                violations.push(format!("t={t:.1}: {head:?} no longer a prefix of {cur:?}"));
+            }
+        }
+        // 2. in the end every spoken word is on screen, in order, exactly once
+        let last = shown.last().map(|(_, d)| d.clone()).unwrap_or_default();
+        let got: Vec<&str> = last.split_whitespace().collect();
+        let expected_len = truth.len();
+        let indices: Vec<usize> = got
+            .iter()
+            .filter_map(|w| w.strip_prefix("slowo").and_then(|n| n.parse().ok()))
+            .collect();
+        // correctly recognised words must appear in order and never twice
+        if indices.windows(2).any(|p| p[1] <= p[0]) {
+            violations.push(format!("duplicate or out-of-order words in {last:?}"));
+        }
+        if got.len() != expected_len {
+            violations.push(format!(
+                "expected {expected_len} words, final caption has {}: {last:?}",
+                got.len()
+            ));
+        }
+        violations
+    }
+
+    #[test]
+    fn continuous_speech_with_a_noisy_recogniser_is_stable_and_loses_nothing() {
+        for seed in 1..=25 {
+            let v = simulate(None, seed);
+            assert!(v.is_empty(), "seed {seed}: {v:#?}");
+        }
+    }
+
+    #[test]
+    fn speech_with_pauses_is_stable_and_loses_nothing() {
+        for pause_after in [8, 15, 22] {
+            for seed in 1..=15 {
+                let v = simulate(Some(pause_after), seed);
+                assert!(
+                    v.is_empty(),
+                    "pause after {pause_after}, seed {seed}: {v:#?}"
+                );
+            }
+        }
     }
 }
